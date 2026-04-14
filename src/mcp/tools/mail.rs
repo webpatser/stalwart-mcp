@@ -139,8 +139,12 @@ fn validate_recipients(addrs: &[String]) -> Result<(), ErrorData> {
     Ok(())
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl StalwartMcp {
+    pub(crate) fn create_tool_router() -> rmcp::handler::server::router::tool::ToolRouter<Self> {
+        Self::tool_router()
+    }
+
     #[tool(description = "List mail folders/mailboxes with message counts")]
     pub async fn mail_list_folders(
         &self,

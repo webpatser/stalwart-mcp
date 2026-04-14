@@ -24,6 +24,13 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail_draft` | Save draft in Drafts folder |
 | `mail_send` | Send email (requires `capabilities.send = true` in config) |
 
+### Prompts
+| Prompt | Description |
+|--------|-------------|
+| `triage_inbox` | Summarize unread emails, flag what's important, suggest actions |
+| `draft_reply` | Draft a contextual reply to a specific email (with tone control) |
+| `search_and_summarize` | Search emails and present a structured summary |
+
 ### Other features
 - **Multi-account** — configure multiple Stalwart accounts, graceful degradation if one fails
 - **Real-time notifications** — JMAP EventSource (SSE) pushes email changes to MCP client
@@ -40,7 +47,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 ## Installation
 
 ```bash
-git clone https://github.com/308/stalwart-mcp.git
+git clone https://github.com/webpatser/stalwart-mcp.git
 cd stalwart-mcp
 cargo install --path .
 ```
@@ -181,7 +188,7 @@ Once connected, ask your AI assistant:
 
 - "List my mail folders"
 - "Show me today's unread emails"
-- "Search for emails from Sophie about the Kempen case"
+- "Search for emails from Sophie about the contract"
 - "Mark that email as read"
 - "Move the newsletter to Archive"
 - "Draft a reply to the latest email from Leaseweb"
@@ -237,11 +244,10 @@ Stalwart Mail Server    (real-time notifications)
 
 - [ ] Calendar tools (JMAP JSCalendar)
 - [ ] Contacts tools (JMAP JSContact)
-- [ ] MCP Resources and Prompts
+- [x] MCP Prompts (triage_inbox, draft_reply, search_and_summarize)
+- [ ] MCP Resources
 - [ ] Docker image
 - [ ] Publish to crates.io
-
-See `docs/PROJECT.md` for the full specification.
 
 ## License
 
