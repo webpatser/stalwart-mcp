@@ -65,7 +65,9 @@ impl RateLimiters {
 
     pub fn check(&self, tool: &'static str) -> Result<(), ErrorData> {
         let mut limiters = self.limiters.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(bucket) = limiters.get_mut(tool) && !bucket.try_consume() {
+        if let Some(bucket) = limiters.get_mut(tool)
+            && !bucket.try_consume()
+        {
             return Err(ErrorData::invalid_request(
                 format!("Rate limit exceeded for '{tool}'. Try again shortly."),
                 None,
