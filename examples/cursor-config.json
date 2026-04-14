@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "stalwart": {
+      "command": "stalwart-mcp",
+      "args": ["serve"],
+      "env": {
+        "STALWART_PASSWORD": "<your-stalwart-password>"
+      }
+    }
+  }
+}

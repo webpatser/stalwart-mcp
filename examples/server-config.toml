@@ -1,0 +1,29 @@
+[[accounts]]
+name = "personal"
+url = "https://mail.example.com"
+username = "user@example.com"
+# Password read from STALWART_PASSWORD env var by default
+# password_env = "STALWART_PASSWORD"
+
+# Add more accounts as needed:
+# [[accounts]]
+# name = "work"
+# url = "https://mail.work.com"
+# username = "user@work.com"
+# password_env = "STALWART_PASSWORD_WORK"
+
+# Optional: first account is used as default if omitted
+# default_account = "personal"
+
+[server]
+bind = "127.0.0.1:3000"
+
+[capabilities]
+# Allow sending emails via mail_send tool (default: false)
+# send = true
+
+[notifications]
+# Enable JMAP EventSource for real-time notifications (default: true)
+# enabled = true
+# Seconds between SSE keepalive pings (default: 30)
+# ping_interval = 30
