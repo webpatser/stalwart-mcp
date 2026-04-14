@@ -75,7 +75,25 @@ async fn main() -> anyhow::Result<()> {
             let manager =
                 AccountManager::connect_all(&config.accounts, config.default_account.as_deref())
                     .await?;
-            let server = StalwartMcp::new(manager, config.capabilities, config.notifications);
+            // Create admin client if spam training is enabled
+            let admin = if config.capabilities.spam_training {
+                let base_url = &config.accounts[0].url;
+                match stalwart_mcp::admin::AdminClient::new(base_url, &config.admin_api) {
+                    Ok(client) => {
+                        tracing::info!("Admin API client initialized for spam training");
+                        Some(client)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to initialize admin API client, spam training disabled");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let server =
+                StalwartMcp::new(manager, config.capabilities, config.notifications, admin);
 
             if let Some(addr) = bind {
                 serve_http(server, &addr, &config.auth).await?;

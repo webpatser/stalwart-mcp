@@ -17,6 +17,8 @@ pub struct AppConfig {
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub admin_api: AdminApiConfig,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -59,6 +61,53 @@ pub struct Capabilities {
     /// Allow sending emails via mail_send tool. Default: false (must explicitly enable).
     #[serde(default)]
     pub send: bool,
+    /// Allow spam training via admin API. Default: false (must explicitly enable).
+    #[serde(default)]
+    pub spam_training: bool,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct AdminApiConfig {
+    /// Admin username. Default: "admin".
+    #[serde(default = "default_admin_username")]
+    pub username: String,
+    /// Admin password directly in config. Takes precedence over password_env.
+    pub password: Option<String>,
+    /// Environment variable name for admin password. Default: "STALWART_ADMIN_PASSWORD".
+    #[serde(default = "default_admin_password_env")]
+    pub password_env: String,
+}
+
+fn default_admin_username() -> String {
+    "admin".to_string()
+}
+
+fn default_admin_password_env() -> String {
+    "STALWART_ADMIN_PASSWORD".to_string()
+}
+
+impl Default for AdminApiConfig {
+    fn default() -> Self {
+        Self {
+            username: default_admin_username(),
+            password: None,
+            password_env: default_admin_password_env(),
+        }
+    }
+}
+
+impl AdminApiConfig {
+    pub fn password(&self) -> Result<String, crate::error::AppError> {
+        if let Some(ref pw) = self.password {
+            return Ok(pw.clone());
+        }
+        std::env::var(&self.password_env).map_err(|_| {
+            crate::error::AppError::Config(format!(
+                "Set 'admin_api.password' in config or environment variable '{}'",
+                self.password_env
+            ))
+        })
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]

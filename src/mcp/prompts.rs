@@ -23,6 +23,16 @@ pub struct SearchSummarizeArgs {
     pub account: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TrainSpamFilterArgs {
+    /// Folder to scan for emails to classify. Default: "Junk"
+    pub folder: Option<String>,
+    /// Maximum number of emails to process. Default: 50
+    pub limit: Option<usize>,
+    /// Account name to use. Omit for the default account.
+    pub account: Option<String>,
+}
+
 #[prompt_router]
 impl StalwartMcp {
     pub(crate) fn create_prompt_router() -> rmcp::handler::server::router::prompt::PromptRouter<Self>
@@ -145,6 +155,54 @@ impl StalwartMcp {
                         "Let me search now."
                     ),
                     query = args.query,
+                    account = account_hint,
+                ),
+            ),
+        ]
+    }
+
+    /// Review emails in a folder and train Stalwart's spam filter.
+    #[prompt(
+        name = "train_spam_filter",
+        description = "Review emails and train the spam filter (Bayes classifier)"
+    )]
+    async fn train_spam_filter(
+        &self,
+        Parameters(args): Parameters<TrainSpamFilterArgs>,
+    ) -> Vec<PromptMessage> {
+        let folder = args.folder.as_deref().unwrap_or("Junk");
+        let limit = args.limit.unwrap_or(50);
+        let account_hint = args
+            .account
+            .as_deref()
+            .map(|a| format!(" (account: {a})"))
+            .unwrap_or_default();
+
+        vec![
+            PromptMessage::new_text(
+                PromptMessageRole::User,
+                format!(
+                    "Train my spam filter by reviewing up to {limit} emails in '{folder}'{account_hint}."
+                ),
+            ),
+            PromptMessage::new_text(
+                PromptMessageRole::Assistant,
+                format!(
+                    concat!(
+                        "I'll train your spam filter. Here's my approach:\n\n",
+                        "1. List up to {limit} emails in '{folder}'{account} using `mail_list_recent`\n",
+                        "2. For each email, fetch the content with `mail_get` and classify it:\n",
+                        "   - **Spam** — unsolicited ads, phishing, scams, bulk marketing\n",
+                        "   - **Ham** — legitimate emails that were incorrectly filed as junk\n",
+                        "3. Batch the classified IDs and submit them via `spam_train`:\n",
+                        "   - All spam IDs with classification \"spam\"\n",
+                        "   - All ham IDs with classification \"ham\"\n",
+                        "4. Report the training results\n\n",
+                        "**Note:** Stalwart needs at least 100 spam and 100 ham samples before the Bayes classifier becomes active.\n\n",
+                        "Let me start by listing emails in {folder}."
+                    ),
+                    limit = limit,
+                    folder = folder,
                     account = account_hint,
                 ),
             ),

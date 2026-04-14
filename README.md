@@ -19,10 +19,11 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 ### Write
 | Tool | Description |
 |------|-------------|
-| `mail_flag` | Mark as read/unread/flagged/unflagged |
+| `mail_flag` | Mark as read/unread/flagged/unflagged/junk/notjunk (junk auto-moves to Junk folder) |
 | `mail_move` | Move to folder (Archive, Trash, etc.) |
 | `mail_draft` | Save draft in Drafts folder |
 | `mail_send` | Send email (requires `capabilities.send = true` in config) |
+| `spam_train` | Train Stalwart's Bayes classifier with emails as spam/ham (requires `capabilities.spam_training = true`) |
 
 ### Prompts
 | Prompt | Description |
@@ -30,6 +31,14 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `triage_inbox` | Summarize unread emails, flag what's important, suggest actions |
 | `draft_reply` | Draft a contextual reply to a specific email (with tone control) |
 | `search_and_summarize` | Search emails and present a structured summary |
+| `train_spam_filter` | Review emails in a folder and train the spam filter |
+
+### Resources
+| URI | Description |
+|-----|-------------|
+| `mail://accounts` | List of configured accounts (name, username, default status) |
+| `mail://{account}/folders` | Mailbox list with message and unread counts |
+| `mail://{account}/messages/{id}` | Full email content by JMAP ID |
 
 ### Other features
 - **Multi-account** — configure multiple Stalwart accounts, graceful degradation if one fails
@@ -75,6 +84,14 @@ password_env = "STALWART_PASSWORD_WORK"
 [capabilities]
 # Allow sending emails (default: false)
 # send = true
+# Allow spam training via admin API (default: false)
+# spam_training = true
+
+[admin_api]
+# Admin username for Stalwart admin API (default: "admin")
+# username = "admin"
+# Env var for admin password (default: "STALWART_ADMIN_PASSWORD")
+# password_env = "STALWART_ADMIN_PASSWORD"
 
 [notifications]
 # Real-time email notifications via JMAP EventSource (default: true)
@@ -245,7 +262,7 @@ Stalwart Mail Server    (real-time notifications)
 - [ ] Calendar tools (JMAP JSCalendar)
 - [ ] Contacts tools (JMAP JSContact)
 - [x] MCP Prompts (triage_inbox, draft_reply, search_and_summarize)
-- [ ] MCP Resources
+- [x] MCP Resources (accounts, folders, messages)
 - [ ] Docker image
 - [ ] Publish to crates.io
 

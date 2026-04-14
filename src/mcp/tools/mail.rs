@@ -27,6 +27,8 @@ pub struct ListRecentArgs {
     pub after: Option<i64>,
     /// Only return emails received before this UTC timestamp (seconds since epoch)
     pub before: Option<i64>,
+    /// Pagination offset (0-based). Use to page through results: first call with offset=0 (default), next with offset=100, etc.
+    pub offset: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -67,8 +69,33 @@ pub struct FlagArgs {
     pub account: Option<String>,
     /// The email message ID
     pub id: String,
-    /// Action: "read", "unread", "flag", or "unflag"
+    /// Action: "read", "unread", "flag", "unflag", "junk", or "notjunk"
     pub action: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SpamTrainArgs {
+    /// Account name to use. Omit for the default account.
+    pub account: Option<String>,
+    /// List of email message IDs to train
+    pub ids: Vec<String>,
+    /// Classification: "spam" or "ham"
+    pub classification: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkJunkArgs {
+    /// Account name to use. Omit for the default account.
+    pub account: Option<String>,
+    /// List of email message IDs to mark as junk (or not junk)
+    pub ids: Vec<String>,
+    /// Action: "junk" or "notjunk"
+    #[serde(default = "default_junk_action")]
+    pub action: String,
+}
+
+fn default_junk_action() -> String {
+    "junk".to_string()
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -199,6 +226,7 @@ impl StalwartMcp {
                 args.unread_only,
                 args.after,
                 args.before,
+                args.offset,
             )
             .await
             .map_err(ErrorData::from)?;
@@ -297,7 +325,9 @@ impl StalwartMcp {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Set or unset email flags. Actions: 'read', 'unread', 'flag', 'unflag'")]
+    #[tool(
+        description = "Set or unset email flags. Actions: 'read', 'unread', 'flag', 'unflag', 'junk' (marks as spam + moves to Junk), 'notjunk' (marks as ham + moves to Inbox)"
+    )]
     pub async fn mail_flag(
         &self,
         Parameters(args): Parameters<FlagArgs>,
@@ -310,23 +340,58 @@ impl StalwartMcp {
             .get(args.account.as_deref())
             .map_err(ErrorData::from)?;
 
-        let (keyword, set) = match args.action.as_str() {
-            "read" => ("$seen", true),
-            "unread" => ("$seen", false),
-            "flag" => ("$flagged", true),
-            "unflag" => ("$flagged", false),
-            other => {
-                return Err(ErrorData::invalid_params(
-                    format!("Unknown action '{other}'. Use: read, unread, flag, unflag"),
-                    None,
-                ));
+        match args.action.as_str() {
+            "junk" => {
+                client
+                    .set_email_keyword(&args.id, "$junk", true)
+                    .await
+                    .map_err(ErrorData::from)?;
+                let junk_id = client
+                    .resolve_mailbox_by_role("Junk")
+                    .await
+                    .map_err(ErrorData::from)?
+                    .ok_or_else(|| ErrorData::internal_error("Junk mailbox not found", None))?;
+                client
+                    .move_email(&args.id, &junk_id)
+                    .await
+                    .map_err(ErrorData::from)?;
             }
-        };
-
-        client
-            .set_email_keyword(&args.id, keyword, set)
-            .await
-            .map_err(ErrorData::from)?;
+            "notjunk" => {
+                client
+                    .set_email_keyword(&args.id, "$junk", false)
+                    .await
+                    .map_err(ErrorData::from)?;
+                let inbox_id = client
+                    .resolve_mailbox_by_role("Inbox")
+                    .await
+                    .map_err(ErrorData::from)?
+                    .ok_or_else(|| ErrorData::internal_error("Inbox mailbox not found", None))?;
+                client
+                    .move_email(&args.id, &inbox_id)
+                    .await
+                    .map_err(ErrorData::from)?;
+            }
+            action => {
+                let (keyword, set) = match action {
+                    "read" => ("$seen", true),
+                    "unread" => ("$seen", false),
+                    "flag" => ("$flagged", true),
+                    "unflag" => ("$flagged", false),
+                    other => {
+                        return Err(ErrorData::invalid_params(
+                            format!(
+                                "Unknown action '{other}'. Use: read, unread, flag, unflag, junk, notjunk"
+                            ),
+                            None,
+                        ));
+                    }
+                };
+                client
+                    .set_email_keyword(&args.id, keyword, set)
+                    .await
+                    .map_err(ErrorData::from)?;
+            }
+        }
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Email {} marked as {}",
@@ -464,5 +529,135 @@ impl StalwartMcp {
         Ok(CallToolResult::success(vec![Content::text(format!(
             "Email sent successfully (ID: {email_id})"
         ))]))
+    }
+
+    #[tool(
+        description = "Bulk mark emails as junk or notjunk. Sets $junk keyword and moves to Junk/Inbox in a single JMAP request. Much faster than flagging one by one."
+    )]
+    pub async fn mail_bulk_junk(
+        &self,
+        Parameters(args): Parameters<BulkJunkArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.rate_limiters.check("mail_bulk_junk")?;
+
+        let (is_junk, action_label) = match args.action.as_str() {
+            "junk" => (true, "junk"),
+            "notjunk" => (false, "not junk"),
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!("Unknown action '{other}'. Use: junk, notjunk"),
+                    None,
+                ));
+            }
+        };
+
+        if args.ids.is_empty() {
+            return Err(ErrorData::invalid_params("No email IDs provided", None));
+        }
+
+        tracing::info!(
+            event = "mail_bulk_junk",
+            account = ?args.account,
+            count = args.ids.len(),
+            action = %args.action,
+            "Tool called"
+        );
+
+        let client = self
+            .accounts
+            .get(args.account.as_deref())
+            .map_err(ErrorData::from)?;
+
+        let role = if is_junk { "Junk" } else { "Inbox" };
+        let target_id = client
+            .resolve_mailbox_by_role(role)
+            .await
+            .map_err(ErrorData::from)?
+            .ok_or_else(|| ErrorData::internal_error(format!("{role} mailbox not found"), None))?;
+
+        let count = client
+            .bulk_keyword_and_move(&args.ids, "$junk", is_junk, &target_id)
+            .await
+            .map_err(ErrorData::from)?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{count} emails marked as {action_label}"
+        ))]))
+    }
+
+    #[tool(
+        description = "Train the spam filter by submitting emails to Stalwart's Bayes classifier. Requires 'spam_training' capability enabled in config."
+    )]
+    pub async fn spam_train(
+        &self,
+        Parameters(args): Parameters<SpamTrainArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.rate_limiters.check("spam_train")?;
+
+        if !self.capabilities.spam_training {
+            return Err(ErrorData::invalid_request(
+                "Spam training is disabled. Enable 'capabilities.spam_training = true' in config.",
+                None,
+            ));
+        }
+
+        let admin = self.admin.as_ref().ok_or_else(|| {
+            ErrorData::internal_error(
+                "Admin API client not available. Check STALWART_ADMIN_PASSWORD env var.",
+                None,
+            )
+        })?;
+
+        let is_spam = match args.classification.as_str() {
+            "spam" => true,
+            "ham" => false,
+            other => {
+                return Err(ErrorData::invalid_params(
+                    format!("Unknown classification '{other}'. Use: spam, ham"),
+                    None,
+                ));
+            }
+        };
+
+        tracing::info!(
+            event = "spam_train",
+            account = ?args.account,
+            count = args.ids.len(),
+            classification = %args.classification,
+            "Training spam filter"
+        );
+
+        let client = self
+            .accounts
+            .get(args.account.as_deref())
+            .map_err(ErrorData::from)?;
+
+        // Fetch raw emails
+        let mut raw_emails = Vec::with_capacity(args.ids.len());
+        for id in &args.ids {
+            match client.get_email_raw(id).await {
+                Ok(raw) => raw_emails.push(raw),
+                Err(e) => {
+                    tracing::warn!(email_id = %id, error = %e, "Failed to fetch raw email, skipping");
+                }
+            }
+        }
+
+        if raw_emails.is_empty() {
+            return Err(ErrorData::invalid_params(
+                "Could not fetch any of the specified emails",
+                None,
+            ));
+        }
+
+        let result = admin
+            .train_batch(raw_emails, is_spam)
+            .await
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        let json = serde_json::to_string_pretty(&result)
+            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 }

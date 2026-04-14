@@ -116,6 +116,7 @@ impl JmapClient {
         unread_only: bool,
         after: Option<i64>,
         before: Option<i64>,
+        position: Option<i32>,
     ) -> Result<Vec<EmailSummary>, AppError> {
         // Step 1: Query for email IDs
         let mut request = self.client.build();
@@ -125,6 +126,10 @@ impl JmapClient {
             .account_id(&self.account_id)
             .sort([email::query::Comparator::received_at().descending()])
             .limit(limit);
+
+        if let Some(pos) = position {
+            query.position(pos);
+        }
 
         let mut filters: Vec<email::query::Filter> = Vec::new();
         if let Some(mb_id) = mailbox_id {
@@ -306,6 +311,31 @@ impl JmapClient {
         Ok(())
     }
 
+    /// Bulk: set keyword + move to mailbox for multiple emails in one JMAP request
+    pub async fn bulk_keyword_and_move(
+        &self,
+        email_ids: &[String],
+        keyword: &str,
+        keyword_set: bool,
+        target_mailbox_id: &str,
+    ) -> Result<usize, AppError> {
+        let mut request = self.client.build();
+        let set = request.set_email().account_id(&self.account_id);
+
+        for id in email_ids {
+            set.update(id)
+                .keyword(keyword, keyword_set)
+                .mailbox_ids([target_mailbox_id]);
+        }
+
+        request
+            .send_set_email()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+
+        Ok(email_ids.len())
+    }
+
     /// Create a draft email
     pub async fn create_draft(&self, compose: &ComposeEmail<'_>) -> Result<String, AppError> {
         // Find the Drafts mailbox
@@ -476,12 +506,50 @@ impl JmapClient {
         Ok(email_to_detail(email))
     }
 
+    /// Download raw RFC 5322 email bytes by email ID (via blob download)
+    pub async fn get_email_raw(&self, email_id: &str) -> Result<Vec<u8>, AppError> {
+        // First get the blob ID for this email
+        let mut request = self.client.build();
+        request
+            .get_email()
+            .account_id(&self.account_id)
+            .ids([email_id])
+            .properties([email::Property::BlobId]);
+
+        let response = request
+            .send_get_email()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+
+        let blob_id = response
+            .list()
+            .first()
+            .and_then(|e| e.blob_id())
+            .ok_or_else(|| AppError::NotFound(format!("Email {email_id} not found")))?
+            .to_string();
+
+        // Download the raw email via JMAP blob download
+        self.client
+            .download(&blob_id)
+            .await
+            .map_err(|e| AppError::JmapRequest(format!("Blob download failed: {e}")))
+    }
+
     /// Resolve a mailbox name (e.g. "INBOX", "Drafts") to its ID
     pub async fn resolve_mailbox_id(&self, name: &str) -> Result<Option<String>, AppError> {
         let mailboxes = self.list_mailboxes().await?;
         Ok(mailboxes
             .into_iter()
             .find(|mb| mb.name.eq_ignore_ascii_case(name))
+            .map(|mb| mb.id))
+    }
+
+    /// Resolve a mailbox by its JMAP role (e.g. "Inbox", "Junk", "Trash") to its ID
+    pub async fn resolve_mailbox_by_role(&self, role: &str) -> Result<Option<String>, AppError> {
+        let mailboxes = self.list_mailboxes().await?;
+        Ok(mailboxes
+            .into_iter()
+            .find(|mb| mb.role.eq_ignore_ascii_case(role))
             .map(|mb| mb.id))
     }
 }

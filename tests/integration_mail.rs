@@ -64,7 +64,7 @@ async fn test_list_recent() {
 
     // Should not error even if empty
     let emails = client
-        .list_recent_emails(None, 5, false, None, None)
+        .list_recent_emails(None, 5, false, None, None, None)
         .await
         .expect("Failed to list recent emails");
 
