@@ -188,10 +188,10 @@ Once connected, ask your AI assistant:
 
 - "List my mail folders"
 - "Show me today's unread emails"
-- "Search for emails from Sophie about the contract"
+- "Search for emails about the contract renewal"
 - "Mark that email as read"
 - "Move the newsletter to Archive"
-- "Draft a reply to the latest email from Leaseweb"
+- "Draft a reply to the latest email from support"
 
 ## CLI reference
 

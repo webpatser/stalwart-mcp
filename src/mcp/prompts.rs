@@ -17,7 +17,7 @@ pub struct DraftReplyArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SearchSummarizeArgs {
-    /// Search query (e.g. "invoice from Leaseweb", "meeting agenda")
+    /// Search query (e.g. "invoice from Acme", "meeting agenda")
     pub query: String,
     /// Account name to use. Omit for the default account.
     pub account: Option<String>,
