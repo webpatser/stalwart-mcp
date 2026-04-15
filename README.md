@@ -21,6 +21,9 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 |------|-------------|
 | `mail_flag` | Mark as read/unread/flagged/unflagged/junk/notjunk (junk auto-moves to Junk folder) |
 | `mail_move` | Move to folder (Archive, Trash, etc.) |
+| `mail_bulk_junk` | Bulk mark emails as junk/notjunk in a single JMAP request |
+| `mail_bulk_delete` | Permanently delete multiple emails in a single JMAP request |
+| `mail_bulk_read` | Bulk mark emails as read in a single JMAP request |
 | `mail_draft` | Save draft in Drafts folder |
 | `mail_send` | Send email (requires `capabilities.send = true` in config) |
 | `spam_train` | Train Stalwart's Bayes classifier with emails as spam/ham (requires `capabilities.spam_training = true`) |

@@ -57,6 +57,10 @@ impl RateLimiters {
         limiters.insert("mail_move", TokenBucket::new(30));
         limiters.insert("mail_draft", TokenBucket::new(10));
         limiters.insert("mail_send", TokenBucket::new(5));
+        limiters.insert("mail_bulk_junk", TokenBucket::new(10));
+        limiters.insert("mail_bulk_delete", TokenBucket::new(10));
+        limiters.insert("mail_bulk_read", TokenBucket::new(10));
+        limiters.insert("spam_train", TokenBucket::new(5));
 
         Self {
             limiters: Mutex::new(limiters),

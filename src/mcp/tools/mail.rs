@@ -94,6 +94,22 @@ pub struct BulkJunkArgs {
     pub action: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkDeleteArgs {
+    /// Account name to use. Omit for the default account.
+    pub account: Option<String>,
+    /// List of email message IDs to permanently delete
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct BulkReadArgs {
+    /// Account name to use. Omit for the default account.
+    pub account: Option<String>,
+    /// List of email message IDs to mark as read
+    pub ids: Vec<String>,
+}
+
 fn default_junk_action() -> String {
     "junk".to_string()
 }
@@ -582,6 +598,76 @@ impl StalwartMcp {
 
         Ok(CallToolResult::success(vec![Content::text(format!(
             "{count} emails marked as {action_label}"
+        ))]))
+    }
+
+    #[tool(
+        description = "Permanently delete multiple emails in a single JMAP request. This destroys the emails entirely — they cannot be recovered. Use this for bulk cleanup of unwanted but non-spam emails (e.g. DMARC reports, automated notifications)."
+    )]
+    pub async fn mail_bulk_delete(
+        &self,
+        Parameters(args): Parameters<BulkDeleteArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.rate_limiters.check("mail_bulk_delete")?;
+
+        if args.ids.is_empty() {
+            return Err(ErrorData::invalid_params("No email IDs provided", None));
+        }
+
+        tracing::info!(
+            event = "mail_bulk_delete",
+            account = ?args.account,
+            count = args.ids.len(),
+            "Tool called"
+        );
+
+        let client = self
+            .accounts
+            .get(args.account.as_deref())
+            .map_err(ErrorData::from)?;
+
+        let count = client
+            .bulk_destroy(&args.ids)
+            .await
+            .map_err(ErrorData::from)?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{count} emails permanently deleted"
+        ))]))
+    }
+
+    #[tool(
+        description = "Bulk mark emails as read in a single JMAP request. Much faster than flagging one by one."
+    )]
+    pub async fn mail_bulk_read(
+        &self,
+        Parameters(args): Parameters<BulkReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.rate_limiters.check("mail_bulk_read")?;
+
+        if args.ids.is_empty() {
+            return Err(ErrorData::invalid_params("No email IDs provided", None));
+        }
+
+        tracing::info!(
+            event = "mail_bulk_read",
+            account = ?args.account,
+            count = args.ids.len(),
+            "Tool called"
+        );
+
+        let client = self
+            .accounts
+            .get(args.account.as_deref())
+            .map_err(ErrorData::from)?;
+
+        let count = client
+            .bulk_keyword(&args.ids, "$seen", true)
+            .await
+            .map_err(ErrorData::from)?;
+
+        Ok(CallToolResult::success(vec![Content::text(format!(
+            "{count} emails marked as read"
         ))]))
     }
 

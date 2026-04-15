@@ -336,6 +336,43 @@ impl JmapClient {
         Ok(email_ids.len())
     }
 
+    /// Bulk: set a keyword on multiple emails in one JMAP request (no move)
+    pub async fn bulk_keyword(
+        &self,
+        email_ids: &[String],
+        keyword: &str,
+        set: bool,
+    ) -> Result<usize, AppError> {
+        let mut request = self.client.build();
+        let set_req = request.set_email().account_id(&self.account_id);
+
+        for id in email_ids {
+            set_req.update(id).keyword(keyword, set);
+        }
+
+        request
+            .send_set_email()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+
+        Ok(email_ids.len())
+    }
+
+    /// Bulk: permanently destroy multiple emails in one JMAP request
+    pub async fn bulk_destroy(&self, email_ids: &[String]) -> Result<usize, AppError> {
+        let mut request = self.client.build();
+        let set = request.set_email().account_id(&self.account_id);
+
+        set.destroy(email_ids);
+
+        request
+            .send_set_email()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+
+        Ok(email_ids.len())
+    }
+
     /// Create a draft email
     pub async fn create_draft(&self, compose: &ComposeEmail<'_>) -> Result<String, AppError> {
         // Find the Drafts mailbox
