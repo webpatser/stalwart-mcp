@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.0] - 2026-04-15
 
 ### Added
 - `mail_bulk_read` tool — bulk mark emails as read in a single JMAP request
