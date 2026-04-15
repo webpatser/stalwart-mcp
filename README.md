@@ -1,10 +1,10 @@
 # stalwart-mcp
 
-A Rust-based [MCP](https://modelcontextprotocol.io/) server for [Stalwart Mail Server](https://stalw.art/), enabling AI assistants to access mail via JMAP — while keeping your data under your own jurisdiction.
+A Rust-based [MCP](https://modelcontextprotocol.io/) server for [Stalwart Mail Server](https://stalw.art/). It lets AI assistants access mail via JMAP while keeping your data under your own jurisdiction.
 
 ## Why
 
-Existing Gmail and Outlook MCP servers route queries through Google/Microsoft APIs. With stalwart-mcp, AI queries hit **your** Stalwart instance directly. Mail data never leaves your infrastructure — only the AI questions and answers go to the LLM provider.
+Existing Gmail and Outlook MCP servers route queries through Google/Microsoft APIs. With stalwart-mcp, AI queries hit **your** Stalwart instance directly. Mail data never leaves your infrastructure; only the AI questions and answers go to the LLM provider.
 
 ## Tools
 
@@ -44,12 +44,12 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail://{account}/messages/{id}` | Full email content by JMAP ID |
 
 ### Other features
-- **Multi-account** — configure multiple Stalwart accounts, graceful degradation if one fails
-- **Real-time notifications** — JMAP EventSource (SSE) pushes email changes to MCP client
-- **Rate limiting** — per-tool token bucket (5-60 calls/min)
-- **Audit logging** — structured tracing on every tool call
-- **JWT auth** — required for remote (non-localhost) HTTP connections
-- **Dual transport** — stdio (local) and Streamable HTTP (remote)
+- **Multi-account**: configure multiple Stalwart accounts with graceful degradation if one fails
+- **Real-time notifications**: JMAP EventSource (SSE) pushes email changes to MCP client
+- **Rate limiting**: per-tool token bucket (5-60 calls/min)
+- **Audit logging**: structured tracing on every tool call
+- **JWT auth**: required for remote (non-localhost) HTTP connections
+- **Dual transport**: stdio (local) and Streamable HTTP (remote)
 
 ## Requirements
 
@@ -271,4 +271,4 @@ Stalwart Mail Server    (real-time notifications)
 
 ## License
 
-AGPL-3.0 — see [LICENSE](LICENSE).
+AGPL-3.0. See [LICENSE](LICENSE).
