@@ -79,15 +79,15 @@ pub fn generate_secret() -> String {
         .collect()
 }
 
-/// Axum middleware: require JWT for non-loopback requests
+/// Axum middleware: require JWT when a secret is configured; otherwise allow loopback only
 pub async fn auth_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     axum::Extension(secret): axum::Extension<AuthSecret>,
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    // Local requests skip auth
-    if addr.ip().is_loopback() {
+    // A configured secret also protects requests from a local reverse proxy.
+    if addr.ip().is_loopback() && secret.0.is_empty() {
         return Ok(next.run(request).await);
     }
 
