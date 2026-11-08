@@ -48,12 +48,12 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 - **Real-time notifications**: JMAP EventSource (SSE) pushes email changes to MCP client
 - **Rate limiting**: per-tool token bucket (5-60 calls/min)
 - **Audit logging**: structured tracing on every tool call
-- **JWT auth**: required for remote (non-localhost) HTTP connections
+- **JWT auth**: required for all HTTP connections when a secret is configured; otherwise only loopback is allowed
 - **Dual transport**: stdio (local) and Streamable HTTP (remote)
 
 ## Requirements
 
-- [Rust](https://rustup.rs/) 1.85+
+- [Rust](https://rustup.rs/) 1.89+
 - A running [Stalwart Mail Server](https://stalw.art/) with JMAP enabled
 
 ## Installation
@@ -61,7 +61,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 ```bash
 git clone https://github.com/webpatser/stalwart-mcp.git
 cd stalwart-mcp
-cargo install --path .
+cargo install --locked --path .
 ```
 
 ## Configuration
@@ -100,6 +100,11 @@ password_env = "STALWART_PASSWORD_WORK"
 # Real-time email notifications via JMAP EventSource (default: true)
 # enabled = true
 # ping_interval = 30
+
+[server]
+# For HTTP behind a reverse proxy, allow its public hostname (optionally with port).
+# Omit or leave empty to retain rmcp's localhost/127.0.0.1/::1 defaults.
+# allowed_hosts = ["mcp.example.com"]
 
 [auth]
 # JWT secret for HTTP mode (auto-generated on first `token create`)
@@ -200,7 +205,7 @@ Then configure your client to connect via HTTP:
 }
 ```
 
-**Note:** Local (127.0.0.1) requests skip JWT auth. Remote requests always require a valid token. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
+**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, only loopback requests are allowed. For a reverse proxy, configure `auth.secret` even when the server binds to loopback. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
 
 ## Example interactions
 
@@ -232,10 +237,10 @@ Global options:
 ## Development
 
 ```bash
-cargo build                    # Build
-cargo build --release          # Release build
-cargo test                     # Run tests
-cargo clippy --all-targets     # Lint
+cargo build --locked                    # Build
+cargo build --locked --release          # Release build
+cargo test --locked                     # Run tests
+cargo clippy --locked --all-targets     # Lint
 cargo fmt                      # Format
 ```
 
@@ -245,7 +250,7 @@ cargo fmt                      # Format
 export STALWART_TEST_URL="https://mail.example.com"
 export STALWART_TEST_USER="user@example.com"
 export STALWART_PASSWORD="your-password"
-cargo test -- --ignored
+cargo test --locked -- --ignored
 ```
 
 ## Architecture

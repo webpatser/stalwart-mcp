@@ -377,7 +377,7 @@ impl JmapClient {
     pub async fn create_draft(&self, compose: &ComposeEmail<'_>) -> Result<String, AppError> {
         // Find the Drafts mailbox
         let drafts_id = self
-            .resolve_mailbox_id("Drafts")
+            .resolve_special_mailbox("Drafts")
             .await?
             .ok_or_else(|| AppError::NotFound("Drafts mailbox not found".into()))?;
 
@@ -420,7 +420,7 @@ impl JmapClient {
     pub async fn send_email(&self, compose: &ComposeEmail<'_>) -> Result<String, AppError> {
         // Find the Sent mailbox
         let sent_id = self
-            .resolve_mailbox_id("Sent")
+            .resolve_special_mailbox("Sent")
             .await?
             .ok_or_else(|| AppError::NotFound("Sent mailbox not found".into()))?;
 
@@ -572,6 +572,12 @@ impl JmapClient {
             .map_err(|e| AppError::JmapRequest(format!("Blob download failed: {e}")))
     }
 
+    /// Prefer the standard role so localized or renamed folders work too.
+    async fn resolve_special_mailbox(&self, role: &str) -> Result<Option<String>, AppError> {
+        let mailboxes = self.list_mailboxes().await?;
+        Ok(special_mailbox_id(&mailboxes, role).map(str::to_owned))
+    }
+
     /// Resolve a mailbox name (e.g. "INBOX", "Drafts") to its ID
     pub async fn resolve_mailbox_id(&self, name: &str) -> Result<Option<String>, AppError> {
         let mailboxes = self.list_mailboxes().await?;
@@ -657,4 +663,48 @@ fn extract_addresses(addrs: Option<&[email::EmailAddress]>) -> Vec<String> {
             None => a.email().to_string(),
         })
         .collect()
+}
+
+fn special_mailbox_id<'a>(mailboxes: &'a [MailboxInfo], role: &str) -> Option<&'a str> {
+    mailboxes
+        .iter()
+        .find(|mb| mb.role.eq_ignore_ascii_case(role))
+        .or_else(|| {
+            mailboxes
+                .iter()
+                .find(|mb| mb.name.eq_ignore_ascii_case(role))
+        })
+        .map(|mb| mb.id.as_str())
+}
+
+#[cfg(test)]
+mod special_mailbox_tests {
+    use super::*;
+
+    fn mailbox(id: &str, name: &str, role: &str) -> MailboxInfo {
+        MailboxInfo {
+            id: id.into(),
+            name: name.into(),
+            role: role.into(),
+            total_emails: 0,
+            unread_emails: 0,
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn role_precedes_name_for_drafts_and_sent() {
+        for role in ["Drafts", "Sent"] {
+            let mailboxes = vec![
+                mailbox("name", role, "None"),
+                mailbox("role", "Localized folder", &role.to_lowercase()),
+            ];
+            assert_eq!(special_mailbox_id(&mailboxes, role), Some("role"));
+            assert_eq!(
+                special_mailbox_id(&mailboxes[..1], &role.to_lowercase()),
+                Some("name")
+            );
+            assert_eq!(special_mailbox_id(&[], role), None);
+        }
+    }
 }
