@@ -26,7 +26,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail_bulk_read` | Bulk mark emails as read in a single JMAP request |
 | `mail_draft` | Save draft in Drafts folder |
 | `mail_send` | Send email (requires `capabilities.send = true` in config) |
-| `spam_train` | Train Stalwart's Bayes classifier with emails as spam/ham (requires `capabilities.spam_training = true`) |
+| `spam_train` | Train Stalwart's Bayes classifier via JMAP `SpamTrainingSample/set` (requires Stalwart v0.16+ and `capabilities.spam_training = true`) |
 
 ### Prompts
 | Prompt | Description |
@@ -55,6 +55,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 
 - [Rust](https://rustup.rs/) 1.89+
 - A running [Stalwart Mail Server](https://stalw.art/) with JMAP enabled
+- Stalwart v0.16+ for `spam_train` (other tools are compatible with v0.15+)
 
 ## Installation
 
@@ -87,14 +88,8 @@ password_env = "STALWART_PASSWORD_WORK"
 [capabilities]
 # Allow sending emails (default: false)
 # send = true
-# Allow spam training via admin API (default: false)
+# Allow spam training via JMAP SpamTrainingSample/set (default: false, requires Stalwart v0.16+)
 # spam_training = true
-
-[admin_api]
-# Admin username for Stalwart admin API (default: "admin")
-# username = "admin"
-# Env var for admin password (default: "STALWART_ADMIN_PASSWORD")
-# password_env = "STALWART_ADMIN_PASSWORD"
 
 [notifications]
 # Real-time email notifications via JMAP EventSource (default: true)

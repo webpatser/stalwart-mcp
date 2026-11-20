@@ -672,7 +672,7 @@ impl StalwartMcp {
     }
 
     #[tool(
-        description = "Train the spam filter by submitting emails to Stalwart's Bayes classifier. Requires 'spam_training' capability enabled in config."
+        description = "Train the spam filter by submitting emails to Stalwart's Bayes classifier via JMAP SpamTrainingSample/set (requires Stalwart v0.16+). Requires 'spam_training' capability enabled in config."
     )]
     pub async fn spam_train(
         &self,
@@ -686,13 +686,6 @@ impl StalwartMcp {
                 None,
             ));
         }
-
-        let admin = self.admin.as_ref().ok_or_else(|| {
-            ErrorData::internal_error(
-                "Admin API client not available. Check STALWART_ADMIN_PASSWORD env var.",
-                None,
-            )
-        })?;
 
         let is_spam = match args.classification.as_str() {
             "spam" => true,
@@ -718,28 +711,26 @@ impl StalwartMcp {
             .get(args.account.as_deref())
             .map_err(ErrorData::from)?;
 
-        // Fetch raw emails
-        let mut raw_emails = Vec::with_capacity(args.ids.len());
-        for id in &args.ids {
-            match client.get_email_raw(id).await {
-                Ok(raw) => raw_emails.push(raw),
-                Err(e) => {
-                    tracing::warn!(email_id = %id, error = %e, "Failed to fetch raw email, skipping");
-                }
-            }
-        }
+        let resolved = client
+            .get_email_blob_ids(&args.ids)
+            .await
+            .map_err(ErrorData::from)?;
 
-        if raw_emails.is_empty() {
+        if resolved.is_empty() {
             return Err(ErrorData::invalid_params(
-                "Could not fetch any of the specified emails",
+                "Could not resolve any of the specified email IDs to blob IDs",
                 None,
             ));
         }
 
-        let result = admin
-            .train_batch(raw_emails, is_spam)
+        let blob_ids: Vec<String> = resolved.into_iter().map(|(_, blob)| blob).collect();
+
+        let spam_filter = client.spam_filter().map_err(ErrorData::from)?;
+
+        let result = spam_filter
+            .train_batch(&blob_ids, is_spam)
             .await
-            .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+            .map_err(ErrorData::from)?;
 
         let json = serde_json::to_string_pretty(&result)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;

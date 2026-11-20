@@ -21,9 +21,15 @@ pub enum AppError {
 
 impl From<AppError> for ErrorData {
     fn from(err: AppError) -> Self {
-        match &err {
-            AppError::NotFound(_) => ErrorData::resource_not_found(err.to_string(), None),
-            _ => ErrorData::internal_error(err.to_string(), None),
+        tracing::warn!(error = %err, "Tool error");
+        match err {
+            AppError::NotFound(msg) => ErrorData::resource_not_found(msg, None),
+            AppError::Auth(_) => ErrorData::invalid_request("Authentication failed", None),
+            AppError::Config(_) => ErrorData::internal_error("Server misconfigured", None),
+            AppError::JmapConnection(_) => {
+                ErrorData::internal_error("Upstream connection failed", None)
+            }
+            AppError::JmapRequest(_) => ErrorData::internal_error("Upstream request failed", None),
         }
     }
 }

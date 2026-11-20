@@ -578,6 +578,36 @@ impl JmapClient {
         Ok(special_mailbox_id(&mailboxes, role).map(str::to_owned))
     }
 
+    /// Fetch blob IDs for a batch of email IDs in a single Email/get call.
+    /// Returns (email_id, blob_id) pairs in the order returned by the server.
+    /// Emails that can't be resolved are silently omitted from the result.
+    pub async fn get_email_blob_ids(
+        &self,
+        email_ids: &[String],
+    ) -> Result<Vec<(String, String)>, AppError> {
+        let mut request = self.client.build();
+        request
+            .get_email()
+            .account_id(&self.account_id)
+            .ids(email_ids.iter().map(String::as_str))
+            .properties([email::Property::Id, email::Property::BlobId]);
+
+        let response = request
+            .send_get_email()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+
+        Ok(response
+            .list()
+            .iter()
+            .filter_map(|e| {
+                let id = e.id()?.to_string();
+                let blob = e.blob_id()?.to_string();
+                Some((id, blob))
+            })
+            .collect())
+    }
+
     /// Resolve a mailbox name (e.g. "INBOX", "Drafts") to its ID
     pub async fn resolve_mailbox_id(&self, name: &str) -> Result<Option<String>, AppError> {
         let mailboxes = self.list_mailboxes().await?;

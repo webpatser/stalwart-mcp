@@ -2,7 +2,6 @@ pub mod prompts;
 pub mod resources;
 pub mod tools;
 
-use crate::admin::AdminClient;
 use crate::config::{Capabilities, NotificationsConfig};
 use crate::jmap::AccountManager;
 use crate::mcp::resources::{ResourceMatch, match_resource_uri};
@@ -25,7 +24,6 @@ pub struct StalwartMcp {
     pub(crate) capabilities: Capabilities,
     pub(crate) notifications: NotificationsConfig,
     pub(crate) rate_limiters: Arc<RateLimiters>,
-    pub(crate) admin: Option<AdminClient>,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -35,14 +33,12 @@ impl StalwartMcp {
         accounts: AccountManager,
         capabilities: Capabilities,
         notifications: NotificationsConfig,
-        admin: Option<AdminClient>,
     ) -> Self {
         Self {
             accounts: Arc::new(accounts),
             capabilities,
             notifications,
             rate_limiters: Arc::new(RateLimiters::new()),
-            admin,
             tool_router: Self::create_tool_router(),
             prompt_router: Self::create_prompt_router(),
         }

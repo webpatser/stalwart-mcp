@@ -75,25 +75,8 @@ async fn main() -> anyhow::Result<()> {
             let manager =
                 AccountManager::connect_all(&config.accounts, config.default_account.as_deref())
                     .await?;
-            // Create admin client if spam training is enabled
-            let admin = if config.capabilities.spam_training {
-                let base_url = &config.accounts[0].url;
-                match stalwart_mcp::admin::AdminClient::new(base_url, &config.admin_api) {
-                    Ok(client) => {
-                        tracing::info!("Admin API client initialized for spam training");
-                        Some(client)
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "Failed to initialize admin API client, spam training disabled");
-                        None
-                    }
-                }
-            } else {
-                None
-            };
 
-            let server =
-                StalwartMcp::new(manager, config.capabilities, config.notifications, admin);
+            let server = StalwartMcp::new(manager, config.capabilities, config.notifications);
 
             if let Some(addr) = bind {
                 serve_http(server, &addr, &config.auth, &config.server).await?;
@@ -214,7 +197,7 @@ fn http_router(
     auth_config: &stalwart_mcp::config::AuthConfig,
     server_config: &stalwart_mcp::config::ServerConfig,
 ) -> axum::Router {
-    use axum::Router;
+    use axum::{Router, extract::DefaultBodyLimit};
     use rmcp::transport::streamable_http_server::{
         StreamableHttpService, session::local::LocalSessionManager,
     };
@@ -237,6 +220,7 @@ fn http_router(
 
     Router::new()
         .nest_service("/mcp", service)
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(axum::middleware::from_fn(
             stalwart_mcp::auth::auth_middleware,
         ))

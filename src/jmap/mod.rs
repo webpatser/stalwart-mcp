@@ -1,10 +1,14 @@
 pub mod mail;
+pub mod spam_filter;
 
 use crate::config::AccountConfig;
 use crate::error::AppError;
 use jmap_client::client::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
+
+use spam_filter::SpamFilterClient;
 
 pub struct JmapClient {
     client: Client,
@@ -53,6 +57,27 @@ impl JmapClient {
 
     pub fn username(&self) -> &str {
         &self.username
+    }
+
+    /// Build a Stalwart spam-filter client that shares this account's JMAP
+    /// endpoint and Basic-auth credentials. Used by the `spam_train` tool to
+    /// call `SpamTrainingSample/set` (Stalwart v0.16+).
+    pub fn spam_filter(&self) -> Result<SpamFilterClient, AppError> {
+        let api_url = self.client.session().api_url().to_string();
+        let headers = self.client.headers().clone();
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .default_headers(headers)
+            .build()
+            .map_err(|e| {
+                AppError::JmapConnection(format!("Failed to build spam-filter HTTP client: {e}"))
+            })?;
+
+        Ok(SpamFilterClient {
+            http,
+            api_url,
+            account_id: self.account_id.clone(),
+        })
     }
 
     /// Start an EventSource stream for real-time change notifications.

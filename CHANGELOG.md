@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.3.0] - 2026-04-21
+
+### Changed
+- **BREAKING:** `spam_train` now calls Stalwart v0.16's JMAP `SpamTrainingSample/set` method instead of the removed `/api/spam-filter/upload/*` REST endpoints. Training runs under the user's own account credentials.
+- Removed `[admin_api]` config section and the `STALWART_ADMIN_PASSWORD` environment variable; no longer needed.
+- `spam_train` no longer downloads raw email bodies locally; the server fetches each email's existing JMAP blob directly.
+
+### Compatibility
+- Requires Stalwart v0.16.x or later for `spam_train`.
+- All other tools remain compatible with v0.15.x and v0.16.x.
+
 ## [0.2.0] - 2026-04-15
 
 ### Added
