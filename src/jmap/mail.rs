@@ -1,6 +1,8 @@
 use crate::error::AppError;
 use crate::jmap::JmapClient;
 use jmap_client::core::query::Filter;
+use jmap_client::core::response::{EmailSetResponse, EmailSubmissionSetResponse};
+use jmap_client::core::set::SetObject;
 use jmap_client::email;
 use jmap_client::mailbox;
 use serde::Serialize;
@@ -282,12 +284,12 @@ impl JmapClient {
             .update(email_id)
             .keyword(keyword, set);
 
-        request
+        let mut response = request
             .send_set_email()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        Ok(())
+        updated_one(&mut response, email_id)
     }
 
     /// Move an email to a different mailbox
@@ -303,12 +305,12 @@ impl JmapClient {
             .update(email_id)
             .mailbox_ids([target_mailbox_id]);
 
-        request
+        let mut response = request
             .send_set_email()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        Ok(())
+        updated_one(&mut response, email_id)
     }
 
     /// Bulk: set keyword + move to mailbox for multiple emails in one JMAP request
@@ -328,12 +330,12 @@ impl JmapClient {
                 .mailbox_ids([target_mailbox_id]);
         }
 
-        request
+        let response = request
             .send_set_email()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        Ok(email_ids.len())
+        updated_count(&response)
     }
 
     /// Bulk: set a keyword on multiple emails in one JMAP request (no move)
@@ -350,12 +352,12 @@ impl JmapClient {
             set_req.update(id).keyword(keyword, set);
         }
 
-        request
+        let response = request
             .send_set_email()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        Ok(email_ids.len())
+        updated_count(&response)
     }
 
     /// Bulk: permanently destroy multiple emails in one JMAP request
@@ -365,12 +367,12 @@ impl JmapClient {
 
         set.destroy(email_ids);
 
-        request
+        let mut response = request
             .send_set_email()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        Ok(email_ids.len())
+        destroyed_count(&mut response)
     }
 
     /// Create a draft email
@@ -402,18 +404,14 @@ impl JmapClient {
         if let Some(refs) = compose.references {
             email.references([refs]);
         }
+        let create_id = creation_id(email.create_id())?;
 
-        let response = request
+        let mut response = request
             .send_set_email()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        let created_id = response
-            .created_ids()
-            .and_then(|mut ids| ids.next().map(|s| s.to_string()))
-            .ok_or_else(|| AppError::JmapRequest("Failed to create draft".into()))?;
-
-        Ok(created_id)
+        created_email_id(&mut response, &create_id)
     }
 
     /// Send an email via EmailSubmission
@@ -461,28 +459,27 @@ impl JmapClient {
         if let Some(refs) = compose.references {
             email.references([refs]);
         }
+        let email_create_id = creation_id(email.create_id())?;
 
-        // Create submission referencing the created email
+        // Create submission referencing the created email by its creation id
         let submission = request
             .set_email_submission()
             .account_id(&self.account_id)
             .create();
 
-        submission.identity_id(&identity_id).email_id("#c0"); // backreference to created email
+        submission
+            .identity_id(&identity_id)
+            .email_id(format!("#{email_create_id}"));
+        let submission_create_id = creation_id(submission.create_id())?;
 
-        // Use send_set_email_submission which processes the batch
-        let response = request
+        // send_set_email_submission returns the last method response, the
+        // EmailSubmission/set one
+        let mut response = request
             .send_set_email_submission()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        // The submission was created successfully if we get here
-        let created_id = response
-            .created_ids()
-            .and_then(|mut ids| ids.next().map(|s| s.to_string()))
-            .unwrap_or_else(|| "sent".to_string());
-
-        Ok(created_id)
+        created_submission_id(&mut response, &submission_create_id)
     }
 
     /// Get the Message-ID header of an email (for reply threading)
@@ -705,6 +702,147 @@ fn special_mailbox_id<'a>(mailboxes: &'a [MailboxInfo], role: &str) -> Option<&'
                 .find(|mb| mb.name.eq_ignore_ascii_case(role))
         })
         .map(|mb| mb.id.as_str())
+}
+
+fn creation_id(create_id: Option<String>) -> Result<String, AppError> {
+    create_id.ok_or_else(|| AppError::JmapRequest("create request has no creation id".into()))
+}
+
+fn set_error(e: jmap_client::Error) -> AppError {
+    AppError::JmapRequest(e.to_string())
+}
+
+/// Server-assigned id of an email created under `create_id`. The keys of the
+/// `created` map are the client's creation ids (`c0`), not email ids.
+fn created_email_id(response: &mut EmailSetResponse, create_id: &str) -> Result<String, AppError> {
+    let id = response.created(create_id).map_err(set_error)?.take_id();
+    non_empty_id(id, "Email/set")
+}
+
+/// Server-assigned id of an email submission created under `create_id`.
+fn created_submission_id(
+    response: &mut EmailSubmissionSetResponse,
+    create_id: &str,
+) -> Result<String, AppError> {
+    let id = response.created(create_id).map_err(set_error)?.take_id();
+    non_empty_id(id, "EmailSubmission/set")
+}
+
+fn non_empty_id(id: String, method: &str) -> Result<String, AppError> {
+    if id.is_empty() {
+        Err(AppError::JmapRequest(format!(
+            "{method} created the object but returned no id"
+        )))
+    } else {
+        Ok(id)
+    }
+}
+
+/// Fail when the server rejected the update of `id` (`notUpdated`).
+fn updated_one(response: &mut EmailSetResponse, id: &str) -> Result<(), AppError> {
+    response.updated(id).map(|_| ()).map_err(set_error)
+}
+
+/// Number of emails updated; an error when none were and the server reported why.
+fn updated_count(response: &EmailSetResponse) -> Result<usize, AppError> {
+    let count = response.updated_ids().map_or(0, Iterator::count);
+    if count == 0 {
+        response.unwrap_update_errors().map_err(set_error)?;
+    }
+    Ok(count)
+}
+
+/// Number of emails destroyed; an error when none were and the server reported why.
+fn destroyed_count(response: &mut EmailSetResponse) -> Result<usize, AppError> {
+    let count = response.destroyed_ids().map_or(0, Iterator::count);
+    if count == 0 {
+        let rejected = response
+            .not_destroyed_ids()
+            .and_then(|mut ids| ids.next().cloned());
+        if let Some(id) = rejected {
+            response.destroyed(&id).map_err(|e| {
+                AppError::JmapRequest(format!("Email/set destroy of {id} failed: {e}"))
+            })?;
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+mod set_response_tests {
+    use super::*;
+
+    fn email_set(json: &str) -> EmailSetResponse {
+        serde_json::from_str(json).expect("valid Email/set response")
+    }
+
+    #[test]
+    fn created_email_id_is_the_server_id_not_the_creation_id() {
+        let mut response = email_set(
+            r#"{"accountId":"a","newState":"s1",
+                "created":{"c0":{"id":"oueaaadvb","blobId":"b1","threadId":"t1","size":120}}}"#,
+        );
+        assert_eq!(
+            created_email_id(&mut response, "c0").expect("created"),
+            "oueaaadvb"
+        );
+    }
+
+    #[test]
+    fn created_email_id_reports_not_created() {
+        let mut response = email_set(
+            r#"{"accountId":"a","newState":"s1","created":null,
+                "notCreated":{"c0":{"type":"invalidProperties","description":"bad from"}}}"#,
+        );
+        let err = created_email_id(&mut response, "c0").expect_err("not created");
+        assert!(err.to_string().contains("bad from"), "{err}");
+    }
+
+    #[test]
+    fn created_email_id_rejects_missing_id() {
+        let mut response = email_set(r#"{"accountId":"a","newState":"s1","created":{"c0":{}}}"#);
+        assert!(created_email_id(&mut response, "c0").is_err());
+    }
+
+    #[test]
+    fn created_submission_id_is_the_server_id() {
+        let mut response: EmailSubmissionSetResponse = serde_json::from_str(
+            r#"{"accountId":"a","newState":"s1","created":{"c0":{"id":"sub-7"}}}"#,
+        )
+        .expect("valid EmailSubmission/set response");
+        assert_eq!(
+            created_submission_id(&mut response, "c0").expect("created"),
+            "sub-7"
+        );
+    }
+
+    #[test]
+    fn creation_id_is_required() {
+        assert_eq!(creation_id(Some("c0".into())).expect("id"), "c0");
+        assert!(creation_id(None).is_err());
+    }
+
+    const REJECTED: &str = r#"{"accountId":"a","newState":"s1",
+        "notUpdated":{"m1":{"type":"notFound"}},
+        "notDestroyed":{"m1":{"type":"notFound","description":"no such email"}}}"#;
+
+    const ACCEPTED: &str = r#"{"accountId":"a","newState":"s1",
+        "updated":{"m1":null,"m2":null},"destroyed":["m3"]}"#;
+
+    #[test]
+    fn update_and_destroy_surface_server_rejections() {
+        assert!(updated_one(&mut email_set(REJECTED), "m1").is_err());
+        assert!(updated_count(&email_set(REJECTED)).is_err());
+        let err = destroyed_count(&mut email_set(REJECTED)).expect_err("rejected");
+        assert!(err.to_string().contains("m1"), "{err}");
+    }
+
+    #[test]
+    fn update_and_destroy_count_what_the_server_accepted() {
+        assert!(updated_one(&mut email_set(ACCEPTED), "m1").is_ok());
+        assert_eq!(updated_count(&email_set(ACCEPTED)).expect("count"), 2);
+        assert_eq!(destroyed_count(&mut email_set(ACCEPTED)).expect("count"), 1);
+    }
 }
 
 #[cfg(test)]

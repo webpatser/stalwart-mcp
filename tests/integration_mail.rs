@@ -12,7 +12,8 @@
 //!   changes the server's spam model
 //!
 //! The write tests only create drafts addressed to the test user (nothing is
-//! sent) and only ever delete the message they created.
+//! sent) and only ever delete the message they created, found by its id or,
+//! when the id is gone, by its unique subject in Drafts and Trash.
 //!
 //! Run with: cargo test --test integration_mail -- --ignored --nocapture
 
@@ -77,21 +78,83 @@ async fn create_self_draft(
         .await
 }
 
-/// Destroy the message only if it still exists and carries the unique subject.
-async fn cleanup(client: &JmapClient, id: &str, subject: &str) {
+/// How many of the newest messages per mailbox the subject sweep inspects.
+const SWEEP_LIMIT: usize = 100;
+
+/// Destroy the test message. If `id` is gone or carries another subject, fall
+/// back to [`cleanup_by_subject`] so a wrong id can never silently leave the
+/// message behind. Returns how many messages were destroyed.
+async fn cleanup(client: &JmapClient, id: &str, subject: &str) -> Result<usize, String> {
     match client.get_email(id).await {
         Ok(detail) if detail.subject.as_deref() == Some(subject) => {
-            match client.bulk_destroy(&[id.to_string()]).await {
-                Ok(_) => eprintln!("cleanup: destroyed {id}"),
-                Err(e) => eprintln!("cleanup: Email/set destroy of {id} failed: {e}"),
-            }
+            let n = client
+                .bulk_destroy(&[id.to_string()])
+                .await
+                .map_err(|e| format!("cleanup: Email/set destroy of {id} failed: {e}"))?;
+            eprintln!("cleanup: destroyed {id}");
+            Ok(n)
         }
-        Ok(detail) => eprintln!(
-            "cleanup: refusing to delete {id}, subject {:?} does not match",
-            detail.subject
-        ),
-        Err(_) => eprintln!("cleanup: {id} no longer exists"),
+        Ok(detail) => {
+            eprintln!(
+                "cleanup: {id} has subject {:?}, not ours; sweeping Drafts and Trash by subject",
+                detail.subject
+            );
+            cleanup_by_subject(client, subject).await
+        }
+        Err(_) => {
+            eprintln!("cleanup: {id} does not exist; sweeping Drafts and Trash by subject");
+            cleanup_by_subject(client, subject).await
+        }
     }
+}
+
+/// Destroy every message in Drafts and Trash whose subject is exactly `subject`.
+/// Uses a plain mailbox listing (no full-text search) and compares the subject
+/// client-side, so nothing with another subject is ever touched.
+async fn cleanup_by_subject(client: &JmapClient, subject: &str) -> Result<usize, String> {
+    let mut destroyed = 0;
+    for role in ["Drafts", "Trash"] {
+        let mailbox = client
+            .resolve_mailbox_by_role(role)
+            .await
+            .map_err(|e| format!("cleanup: Mailbox/get failed: {e}"))?
+            .ok_or_else(|| format!("cleanup: no {role} mailbox by role"))?;
+        let ids: Vec<String> = client
+            .list_recent_emails(Some(&mailbox), SWEEP_LIMIT, false, None, None, None)
+            .await
+            .map_err(|e| format!("cleanup: Email/query in {role} failed: {e}"))?
+            .into_iter()
+            .filter(|e| e.subject.as_deref() == Some(subject))
+            .map(|e| e.id)
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let n = client
+            .bulk_destroy(&ids)
+            .await
+            .map_err(|e| format!("cleanup: Email/set destroy of {ids:?} failed: {e}"))?;
+        eprintln!("cleanup: destroyed {n} of {ids:?} in {role} by exact subject {subject:?}");
+        destroyed += n;
+    }
+    if destroyed == 0 {
+        eprintln!("cleanup: no message with subject {subject:?} left in Drafts or Trash");
+    }
+    Ok(destroyed)
+}
+
+/// Whether `id` is among the newest messages of a mailbox (plain listing, no
+/// full-text search).
+async fn listed_in_mailbox(
+    client: &JmapClient,
+    mailbox_id: &str,
+    id: &str,
+) -> Result<bool, String> {
+    client
+        .list_recent_emails(Some(mailbox_id), SWEEP_LIMIT, false, None, None, None)
+        .await
+        .map(|found| found.iter().any(|e| e.id == id))
+        .map_err(|e| format!("Email/query inMailbox failed: {e}"))
 }
 
 /// Search by the unique subject, retrying while the server indexes the message.
@@ -102,7 +165,7 @@ async fn find_by_subject(
     id: &str,
 ) -> Result<(), String> {
     let mut last = String::new();
-    for _ in 0..10 {
+    for attempt in 1..=SEARCH_ATTEMPTS {
         match client
             .search_emails(&SearchFilters {
                 subject: Some(subject),
@@ -114,18 +177,29 @@ async fn find_by_subject(
         {
             Ok(found) => {
                 if found.iter().any(|e| e.id == id) {
+                    eprintln!("Email/query by subject found {id} on attempt {attempt}");
                     return Ok(());
                 }
-                last = format!("not found among {} results", found.len());
+                last = format!(
+                    "not found among {} results {:?}",
+                    found.len(),
+                    found.iter().map(|e| e.id.as_str()).collect::<Vec<_>>()
+                );
             }
             Err(e) => last = format!("Email/query failed: {e}"),
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(SEARCH_INTERVAL).await;
     }
     Err(format!(
-        "Email/query by subject {subject:?} never returned {id}: {last}"
+        "Email/query by subject {subject:?} never returned {id} within {:?}: {last}",
+        SEARCH_INTERVAL * SEARCH_ATTEMPTS
     ))
 }
+
+/// Stalwart indexes full text asynchronously: a subject query on a new message
+/// came back empty for about 26 seconds on 1.1.1. Give it up to a minute.
+const SEARCH_ATTEMPTS: u32 = 60;
+const SEARCH_INTERVAL: Duration = Duration::from_secs(1);
 
 #[tokio::test]
 #[ignore = "requires running Stalwart instance"]
@@ -352,10 +426,16 @@ async fn test_draft_lifecycle() {
     eprintln!("created draft {id} with subject {subject:?}");
 
     let outcome = draft_steps(&client, &id, &subject).await;
-    cleanup(&client, &id, &subject).await;
+    let cleaned = cleanup(&client, &id, &subject).await;
     if let Err(msg) = outcome {
-        panic!("{msg}");
+        panic!("{msg} ({cleaned:?})");
     }
+    // The steps destroy the draft themselves, so cleanup must find nothing left.
+    assert_eq!(
+        cleaned,
+        Ok(0),
+        "the lifecycle left its draft behind; cleanup removed it"
+    );
 }
 
 async fn draft_steps(client: &JmapClient, id: &str, subject: &str) -> Result<(), String> {
@@ -370,6 +450,9 @@ async fn draft_steps(client: &JmapClient, id: &str, subject: &str) -> Result<(),
         .map_err(|e| format!("Mailbox/get failed: {e}"))?
         .ok_or("no Trash mailbox by role")?;
 
+    if !listed_in_mailbox(client, &drafts, id).await? {
+        return Err(format!("Email/query inMailbox Drafts does not list {id}"));
+    }
     find_by_subject(client, subject, Some(&drafts), id).await?;
 
     let detail = client
@@ -417,6 +500,9 @@ async fn draft_steps(client: &JmapClient, id: &str, subject: &str) -> Result<(),
         .move_email(id, &trash)
         .await
         .map_err(|e| format!("Email/set update mailboxIds (move to Trash) failed: {e}"))?;
+    if !listed_in_mailbox(client, &trash, id).await? {
+        return Err(format!("Email/query inMailbox Trash does not list {id}"));
+    }
     find_by_subject(client, subject, Some(&trash), id).await?;
 
     // Permanent delete, then confirm it is gone.
@@ -482,8 +568,11 @@ async fn test_spam_training() {
     }
     .await;
 
-    cleanup(&client, &id, &subject).await;
+    let cleaned = cleanup(&client, &id, &subject).await;
     if let Err(msg) = outcome {
+        panic!("{msg} ({cleaned:?})");
+    }
+    if let Err(msg) = cleaned {
         panic!("{msg}");
     }
 }
