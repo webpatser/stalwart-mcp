@@ -28,6 +28,20 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail_send` | Send email (requires `capabilities.send = true` in config) |
 | `spam_train` | Train Stalwart's Bayes classifier via JMAP `SpamTrainingSample/set` (requires Stalwart v0.16+ and `capabilities.spam_training = true`) |
 
+### Account
+
+| Tool | Description |
+|------|-------------|
+| `mail_masked_list` | List masked email addresses (Stalwart 1.1+, `x:MaskedEmail/get`) |
+| `mail_masked_create` | Create a server-generated masked address, optionally with a prefix, domain, description, site and expiry (requires `capabilities.masked_email = true`; the server limits the number per account) |
+| `mail_masked_disable` | Disable a masked address so mail to it is no longer delivered (requires `capabilities.masked_email = true`) |
+| `mail_vacation_get` | Get the vacation response (out-of-office auto-reply) |
+| `mail_vacation_set` | Replace the vacation response; omitted fields are cleared (requires `capabilities.vacation = true`) |
+| `quota_get` | Storage quota usage and limits (`Quota/get`, RFC 9425) |
+| `identity_list` | Sending identities: From addresses, reply-to, bcc, signatures |
+
+Every tool takes an optional `account` argument; omit it for the default account.
+
 ### Prompts
 | Prompt | Description |
 |--------|-------------|
@@ -55,7 +69,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 
 - [Rust](https://rustup.rs/) 1.89+
 - A running [Stalwart Mail Server](https://stalw.art/) with JMAP enabled
-- Stalwart v0.16+ for `spam_train` (other tools are compatible with v0.15+)
+- Stalwart v0.16+ for `spam_train`, Stalwart 1.1+ for the masked email tools (other tools are compatible with v0.15+)
 
 ## Versioning
 
@@ -66,8 +80,11 @@ To pick a build for your server, take the newest tag whose first three numbers a
 | stalwart-mcp | Stalwart |
 |--------------|----------|
 | `1.0.3-1`    | 1.0.3    |
+| `1.1.1-1`    | 1.1.1    |
 
-Test coverage: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3. `spam_train` over JMAP (`SpamTrainingSample/set`) has not yet been verified on a live 1.x server.
+Test coverage for `1.0.3-1`: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3.
+
+Test coverage for `1.1.1-1`, run live against Stalwart 1.1.1 (`tests/integration_mail.rs` and `tests/integration_account.rs`): connect and session capabilities; mailbox listing and role lookup; recent listing, search, full message, raw blob and Message-ID reads; the draft lifecycle (create, search, read/unread, move to Trash, permanent delete); masked email list, create, disable and destroy; vacation response get, set (disabled only) and restore; `Quota/get` (on an account without a disk quota, so an empty list) and `Identity/get`. Not run live: `mail_send` (EmailSubmission), `spam_train` (`SpamTrainingSample/set`), an enabled vacation response, and the masked address quota error.
 
 ## Installation
 
@@ -102,6 +119,12 @@ password_env = "STALWART_PASSWORD_WORK"
 # send = true
 # Allow spam training via JMAP SpamTrainingSample/set (default: false, requires Stalwart v0.16+)
 # spam_training = true
+# Allow creating and disabling masked email addresses (default: false, requires Stalwart 1.1+).
+# Listing them is always allowed.
+# masked_email = true
+# Allow changing the vacation response (default: false). When enabled, the server
+# sends auto-replies. Reading it is always allowed.
+# vacation = true
 
 [notifications]
 # Real-time email notifications via JMAP EventSource (default: true)
@@ -258,8 +281,10 @@ cargo fmt                      # Format
 export STALWART_TEST_URL="https://mail.example.com"
 export STALWART_TEST_USER="user@example.com"
 export STALWART_PASSWORD="your-password"
-cargo test --locked -- --ignored
+cargo test --locked -- --ignored --test-threads=1
 ```
+
+The account tests (`tests/integration_account.rs`) write to the account and restore it: they create, disable and destroy one masked address, and set a disabled vacation response before putting the prior one back. They skip the vacation write when an auto-reply is active.
 
 ## Architecture
 

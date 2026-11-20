@@ -66,6 +66,14 @@ pub struct Capabilities {
     /// Default: false (must explicitly enable).
     #[serde(default)]
     pub spam_training: bool,
+    /// Allow creating and disabling Stalwart masked addresses (`x:MaskedEmail/set`,
+    /// Stalwart 1.1+). Listing them is always allowed. Default: false.
+    #[serde(default)]
+    pub masked_email: bool,
+    /// Allow changing the vacation response, which makes the server send
+    /// auto-replies when enabled. Reading it is always allowed. Default: false.
+    #[serde(default)]
+    pub vacation: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -198,6 +206,15 @@ mod tests {
     fn validate_passes_empty_allowed_hosts_without_secret() {
         assert!(config(Vec::new(), None).validate(true).is_ok());
         assert!(config(Vec::new(), Some("")).validate(true).is_ok());
+    }
+
+    #[test]
+    fn write_capabilities_default_to_off() {
+        let caps: Capabilities = serde_json::from_str("{}").expect("capabilities");
+        assert!(!caps.send && !caps.spam_training && !caps.masked_email && !caps.vacation);
+        let caps: Capabilities =
+            serde_json::from_str(r#"{"masked_email": true, "vacation": true}"#).expect("caps");
+        assert!(caps.masked_email && caps.vacation);
     }
 
     #[test]

@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.1.1-1] - 2026-11-20
+
+Tested against Stalwart 1.1.1.
+
+### Added
+- `mail_masked_list`, `mail_masked_create` and `mail_masked_disable`: Stalwart masked email addresses (`x:MaskedEmail/get` and `x:MaskedEmail/set` under `urn:stalwart:jmap`, Stalwart 1.1+). The server generates the address; a create may name a prefix, one of the account's domains, a description, the site it is for and an expiry. Disabling keeps the address.
+- `mail_vacation_get` and `mail_vacation_set`: the RFC 8621 vacation response. A set replaces the whole response, so omitted fields are cleared.
+- `quota_get` (`Quota/get`, RFC 9425) and `identity_list` (`Identity/get`).
+- New capability flags `capabilities.masked_email` (create and disable masked addresses) and `capabilities.vacation` (change the vacation response, which makes the server send auto-replies). Both default to false; the list and get tools are always available.
+- Server refusals from the new tools (for example the per-account masked address quota, `overQuota`) are passed to the client with the server's reason instead of a generic upstream error.
+
+### Changed
+- The `mail_search` description notes that Stalwart indexes full text asynchronously, so very recent mail may not be found yet.
+
+### Fixed
+- `mail_draft` and `mail_send` now return the server's message id instead of a placeholder creation id.
+- Rejected updates, moves and deletes are reported as errors, and the bulk tools return the number of messages the server actually changed.
+
 ## [1.0.3-1] - 2026-11-20
 
 Versioning change: releases are now numbered `<stalwart version>-<mcp revision>`. The first three numbers are the Stalwart Mail Server release this build was tested against, and the number after the hyphen counts MCP-only releases on that Stalwart version (`1.0.3-1`, `1.0.3-2`, then `1.0.4-1` when Stalwart's API changes). This replaces the planned 0.3.0. Earlier releases (0.1.x and 0.2.0) keep their numbers.

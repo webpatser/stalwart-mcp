@@ -17,6 +17,12 @@ pub enum AppError {
 
     #[error("Resource not found: {0}")]
     NotFound(String),
+
+    /// The server answered but refused the call or one of its objects (a JMAP
+    /// method-level error or a SetError). Carries the server's own reason, which
+    /// is passed on to the MCP client so it can act on it (for example a quota).
+    #[error("Rejected by the server: {0}")]
+    Rejected(String),
 }
 
 impl From<AppError> for ErrorData {
@@ -30,6 +36,28 @@ impl From<AppError> for ErrorData {
                 ErrorData::internal_error("Upstream connection failed", None)
             }
             AppError::JmapRequest(_) => ErrorData::internal_error("Upstream request failed", None),
+            AppError::Rejected(msg) => {
+                ErrorData::invalid_request(format!("Rejected by the server: {msg}"), None)
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_passes_the_server_reason_to_the_client() {
+        let data = ErrorData::from(AppError::Rejected(
+            "x:MaskedEmail/set create: overQuota: too many".into(),
+        ));
+        assert!(data.message.contains("overQuota: too many"), "{data:?}");
+    }
+
+    #[test]
+    fn request_failures_stay_opaque() {
+        let data = ErrorData::from(AppError::JmapRequest("secret detail".into()));
+        assert!(!data.message.contains("secret detail"));
     }
 }

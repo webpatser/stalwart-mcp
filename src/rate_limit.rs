@@ -61,6 +61,13 @@ impl RateLimiters {
         limiters.insert("mail_bulk_delete", TokenBucket::new(10));
         limiters.insert("mail_bulk_read", TokenBucket::new(10));
         limiters.insert("spam_train", TokenBucket::new(5));
+        limiters.insert("mail_masked_list", TokenBucket::new(30));
+        limiters.insert("mail_masked_create", TokenBucket::new(5));
+        limiters.insert("mail_masked_disable", TokenBucket::new(10));
+        limiters.insert("mail_vacation_get", TokenBucket::new(30));
+        limiters.insert("mail_vacation_set", TokenBucket::new(5));
+        limiters.insert("quota_get", TokenBucket::new(30));
+        limiters.insert("identity_list", TokenBucket::new(30));
 
         Self {
             limiters: Mutex::new(limiters),

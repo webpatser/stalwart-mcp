@@ -1,4 +1,7 @@
+pub mod account;
 pub mod mail;
+pub mod masked_email;
+pub mod raw;
 pub mod spam_filter;
 
 use crate::config::AccountConfig;
@@ -8,6 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use raw::RawJmap;
 use spam_filter::SpamFilterClient;
 
 pub struct JmapClient {
@@ -78,6 +82,22 @@ impl JmapClient {
             api_url,
             account_id: self.account_id.clone(),
         })
+    }
+
+    /// Build an untyped JMAP caller that shares this account's API URL and
+    /// Basic-auth credentials. Used for masked email, vacation response, quota
+    /// and identity calls.
+    pub fn raw(&self) -> Result<RawJmap, AppError> {
+        let api_url = self.client.session().api_url().to_string();
+        let headers = self.client.headers().clone();
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .default_headers(headers)
+            .build()
+            .map_err(|e| {
+                AppError::JmapConnection(format!("Failed to build JMAP HTTP client: {e}"))
+            })?;
+        Ok(RawJmap::new(http, api_url, self.account_id.clone()))
     }
 
     /// Start an EventSource stream for real-time change notifications.

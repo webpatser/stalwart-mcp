@@ -46,7 +46,7 @@ impl StalwartMcp {
             capabilities,
             notifications,
             rate_limiters: Arc::new(RateLimiters::new()),
-            tool_router: Self::create_tool_router(),
+            tool_router: Self::create_tool_router() + Self::create_account_tool_router(),
             prompt_router: Self::create_prompt_router(),
         }
     }

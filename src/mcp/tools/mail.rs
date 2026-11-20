@@ -254,7 +254,7 @@ impl StalwartMcp {
     }
 
     #[tool(
-        description = "Search emails with filters. Supports full-text search (Meilisearch FTS), sender/recipient/subject filters, date range, and attachment filter. At least one filter must be provided."
+        description = "Search emails with filters. Supports full-text search (Meilisearch FTS), sender/recipient/subject filters, date range, and attachment filter. At least one filter must be provided. Stalwart indexes full text asynchronously, so mail created in the last minute may not be found yet."
     )]
     pub async fn mail_search(
         &self,

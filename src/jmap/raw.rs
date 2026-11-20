@@ -1,0 +1,334 @@
+//! Untyped JMAP method calls for objects jmap-client 0.4 does not model, or
+//! models in a way that cannot express what a tool needs (for example setting
+//! a VacationResponse property back to `null`).
+//!
+//! One call per request, call id `c0`. Server refusals (a method-level
+//! `error` response, a SetError, or an HTTP problem document) become
+//! [`AppError::Rejected`] with the server's own reason; transport and parse
+//! failures stay [`AppError::JmapRequest`].
+
+use crate::error::AppError;
+use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use serde_json::{Map, Value, json};
+
+pub const JMAP_CORE: &str = "urn:ietf:params:jmap:core";
+const CALL_ID: &str = "c0";
+
+/// Shares the account's JMAP API URL and Basic-auth headers.
+#[derive(Debug, Clone)]
+pub struct RawJmap {
+    http: reqwest::Client,
+    api_url: String,
+    account_id: String,
+}
+
+impl RawJmap {
+    pub(crate) fn new(http: reqwest::Client, api_url: String, account_id: String) -> Self {
+        Self {
+            http,
+            api_url,
+            account_id,
+        }
+    }
+
+    pub fn account_id(&self) -> &str {
+        &self.account_id
+    }
+
+    /// Send one method call and return its response arguments.
+    pub async fn call(
+        &self,
+        capabilities: &[&str],
+        method: &str,
+        args: Value,
+    ) -> Result<Value, AppError> {
+        let request = build_request(capabilities, method, args);
+        let response = self
+            .http
+            .post(&self.api_url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| AppError::JmapRequest(format!("{method} request failed: {e}")))?;
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| AppError::JmapRequest(format!("{method} response body failed: {e}")))?;
+        if !status.is_success() {
+            return Err(http_error(method, status.as_u16(), &body));
+        }
+        let body: Value = serde_json::from_str(&body)
+            .map_err(|e| AppError::JmapRequest(format!("{method} returned invalid JSON: {e}")))?;
+        parse_response(method, body)
+    }
+
+    /// [`Self::call`] and deserialize the response arguments into `T`.
+    pub async fn call_as<T: DeserializeOwned>(
+        &self,
+        capabilities: &[&str],
+        method: &str,
+        args: Value,
+    ) -> Result<T, AppError> {
+        let value = self.call(capabilities, method, args).await?;
+        parse_args(method, value)
+    }
+}
+
+/// Build a single-call JMAP request. `urn:ietf:params:jmap:core` is always used.
+pub fn build_request(capabilities: &[&str], method: &str, args: Value) -> Value {
+    let mut using = vec![JMAP_CORE];
+    for capability in capabilities {
+        if !using.contains(capability) {
+            using.push(capability);
+        }
+    }
+    json!({
+        "using": using,
+        "methodCalls": [[method, args, CALL_ID]],
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    #[serde(rename = "methodResponses")]
+    method_responses: Vec<(String, Value, String)>,
+}
+
+/// Extract the response arguments of the single call in `body`.
+pub fn parse_response(method: &str, body: Value) -> Result<Value, AppError> {
+    let envelope: Envelope = serde_json::from_value(body)
+        .map_err(|e| AppError::JmapRequest(format!("{method} returned no methodResponses: {e}")))?;
+    let (name, args, _) = envelope
+        .method_responses
+        .into_iter()
+        .next()
+        .ok_or_else(|| AppError::JmapRequest(format!("{method}: empty methodResponses")))?;
+    if name == "error" {
+        return Err(AppError::Rejected(format!(
+            "{method}: {}",
+            describe_error(&args)
+        )));
+    }
+    if name != method {
+        return Err(AppError::JmapRequest(format!(
+            "{method}: unexpected response {name}"
+        )));
+    }
+    Ok(args)
+}
+
+pub fn parse_args<T: DeserializeOwned>(method: &str, value: Value) -> Result<T, AppError> {
+    serde_json::from_value(value)
+        .map_err(|e| AppError::JmapRequest(format!("{method}: unexpected response shape: {e}")))
+}
+
+/// `type: description (properties: a, b)` of a JMAP method error or SetError.
+pub fn describe_error(err: &Value) -> String {
+    let kind = err
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+    let mut text = match err.get("description").and_then(Value::as_str) {
+        Some(description) if !description.is_empty() => format!("{kind}: {description}"),
+        _ => kind.to_string(),
+    };
+    if let Some(properties) = err.get("properties").and_then(Value::as_array) {
+        let names: Vec<&str> = properties.iter().filter_map(Value::as_str).collect();
+        if !names.is_empty() {
+            text.push_str(&format!(" (properties: {})", names.join(", ")));
+        }
+    }
+    text
+}
+
+/// A non-2xx answer. A JMAP problem document (RFC 8620 section 3.6.1, for
+/// example an unknown capability) is a server refusal and keeps its detail.
+fn http_error(method: &str, status: u16, body: &str) -> AppError {
+    let problem: Option<Value> = serde_json::from_str(body).ok();
+    let detail = problem.as_ref().and_then(|p| {
+        ["detail", "title", "type"]
+            .iter()
+            .find_map(|key| p.get(*key).and_then(Value::as_str))
+            .map(str::to_string)
+    });
+    match detail {
+        Some(detail) if (400..500).contains(&status) => {
+            AppError::Rejected(format!("{method}: HTTP {status}: {detail}"))
+        }
+        _ => AppError::JmapRequest(format!("{method} returned HTTP {status}")),
+    }
+}
+
+/// The `/set` response fields a tool needs to judge one object's outcome.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetResponse {
+    #[serde(default)]
+    pub created: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub updated: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub destroyed: Option<Vec<String>>,
+    #[serde(default)]
+    pub not_created: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub not_updated: Option<Map<String, Value>>,
+    #[serde(default)]
+    pub not_destroyed: Option<Map<String, Value>>,
+}
+
+impl SetResponse {
+    fn rejection(method: &str, verb: &str, key: &str, err: &Value) -> AppError {
+        AppError::Rejected(format!("{method} {verb} {key}: {}", describe_error(err)))
+    }
+
+    /// The server-set properties of the created object (always including `id`).
+    pub fn created_one(&mut self, method: &str, create_id: &str) -> Result<Value, AppError> {
+        if let Some(err) = self.not_created.as_ref().and_then(|m| m.get(create_id)) {
+            return Err(Self::rejection(method, "create", create_id, err));
+        }
+        let created = self
+            .created
+            .as_mut()
+            .and_then(|m| m.remove(create_id))
+            .ok_or_else(|| {
+                AppError::JmapRequest(format!("{method}: server did not report {create_id}"))
+            })?;
+        match created.get("id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => Ok(created),
+            _ => Err(AppError::JmapRequest(format!(
+                "{method}: created {create_id} without an id"
+            ))),
+        }
+    }
+
+    pub fn updated_one(&self, method: &str, id: &str) -> Result<(), AppError> {
+        if let Some(err) = self.not_updated.as_ref().and_then(|m| m.get(id)) {
+            return Err(Self::rejection(method, "update", id, err));
+        }
+        if self.updated.as_ref().is_some_and(|m| m.contains_key(id)) {
+            Ok(())
+        } else {
+            Err(AppError::JmapRequest(format!(
+                "{method}: server did not report the update of {id}"
+            )))
+        }
+    }
+
+    pub fn destroyed_one(&self, method: &str, id: &str) -> Result<(), AppError> {
+        if let Some(err) = self.not_destroyed.as_ref().and_then(|m| m.get(id)) {
+            return Err(Self::rejection(method, "destroy", id, err));
+        }
+        if self
+            .destroyed
+            .as_ref()
+            .is_some_and(|ids| ids.iter().any(|d| d == id))
+        {
+            Ok(())
+        } else {
+            Err(AppError::JmapRequest(format!(
+                "{method}: server did not report the destroy of {id}"
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn set(value: Value) -> SetResponse {
+        serde_json::from_value(value).expect("set response")
+    }
+
+    #[test]
+    fn request_always_uses_core_once() {
+        let request = build_request(
+            &["urn:stalwart:jmap", JMAP_CORE],
+            "x:MaskedEmail/get",
+            json!({"accountId": "a"}),
+        );
+        assert_eq!(
+            request["using"],
+            json!(["urn:ietf:params:jmap:core", "urn:stalwart:jmap"])
+        );
+        assert_eq!(
+            request["methodCalls"],
+            json!([["x:MaskedEmail/get", {"accountId": "a"}, "c0"]])
+        );
+    }
+
+    #[test]
+    fn method_error_is_a_rejection_with_the_server_reason() {
+        let body = json!({"methodResponses": [["error", {"type": "unknownMethod", "description": "nope"}, "c0"]]});
+        let err = parse_response("x:MaskedEmail/get", body).expect_err("error");
+        assert!(matches!(err, AppError::Rejected(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "Rejected by the server: x:MaskedEmail/get: unknownMethod: nope"
+        );
+    }
+
+    #[test]
+    fn unexpected_method_name_is_an_error() {
+        let body = json!({"methodResponses": [["Other/get", {}, "c0"]]});
+        assert!(parse_response("Quota/get", body).is_err());
+    }
+
+    #[test]
+    fn describe_error_lists_properties() {
+        let err = json!({"type": "invalidProperties", "properties": ["email", "url"]});
+        assert_eq!(
+            describe_error(&err),
+            "invalidProperties (properties: email, url)"
+        );
+    }
+
+    #[test]
+    fn problem_document_is_a_rejection() {
+        let body = r#"{"type":"urn:ietf:params:jmap:error:unknownCapability","status":400,"detail":"Unknown capability"}"#;
+        let err = http_error("Quota/get", 400, body);
+        assert!(matches!(err, AppError::Rejected(ref m) if m.contains("Unknown capability")));
+        assert!(matches!(
+            http_error("Quota/get", 502, "bad gateway"),
+            AppError::JmapRequest(_)
+        ));
+    }
+
+    #[test]
+    fn set_outcomes_surface_rejections() {
+        let mut response = set(json!({
+            "created": {"k0": {"id": "m1", "email": "x@example.com"}},
+            "updated": {"m2": null},
+            "destroyed": ["m3"],
+            "notCreated": {"k1": {"type": "overQuota", "description": "limit reached"}},
+            "notUpdated": {"m4": {"type": "notFound"}},
+            "notDestroyed": {"m5": {"type": "forbidden"}}
+        }));
+        assert_eq!(
+            response.created_one("M/set", "k0").expect("created")["id"],
+            "m1"
+        );
+        let err = response.created_one("M/set", "k1").expect_err("quota");
+        assert_eq!(
+            err.to_string(),
+            "Rejected by the server: M/set create k1: overQuota: limit reached"
+        );
+        assert!(response.updated_one("M/set", "m2").is_ok());
+        assert!(matches!(
+            response.updated_one("M/set", "m4"),
+            Err(AppError::Rejected(_))
+        ));
+        assert!(response.destroyed_one("M/set", "m3").is_ok());
+        assert!(matches!(
+            response.destroyed_one("M/set", "m5"),
+            Err(AppError::Rejected(_))
+        ));
+        assert!(matches!(
+            response.destroyed_one("M/set", "m9"),
+            Err(AppError::JmapRequest(_))
+        ));
+    }
+}
