@@ -10,10 +10,14 @@
 //!   of the self-addressed drafts (defaults to STALWART_TEST_USER)
 //! - STALWART_TEST_SPAM_TRAIN=1: also run the spam training test, which
 //!   changes the server's spam model
+//! - STALWART_TEST_SEND_TO: the one address `test_send_email` may send a real
+//!   message to (one plain-text message per run, no cc or bcc). Without it
+//!   the send test is skipped. Never commit the address.
 //!
-//! The write tests only create drafts addressed to the test user (nothing is
-//! sent) and only ever delete the message they created, found by its id or,
-//! when the id is gone, by its unique subject in Drafts and Trash.
+//! The draft tests only create drafts addressed to the test user (nothing is
+//! sent). Every write test only ever deletes the message it created, found by
+//! its id or, when the id is gone, by its unique subject in Drafts and Trash;
+//! the send test removes its own copy from Sent after the checks.
 //!
 //! Run with: cargo test --test integration_mail -- --ignored --nocapture
 
@@ -514,6 +518,157 @@ async fn draft_steps(client: &JmapClient, id: &str, subject: &str) -> Result<(),
         return Err(format!(
             "Email/set destroy reported success but {id} still exists"
         ));
+    }
+    Ok(())
+}
+
+/// Whether `id` looks like a client creation id (`c0`, `c1`, ...) rather than a
+/// server-assigned email id.
+fn is_creation_id(id: &str) -> bool {
+    id.strip_prefix('c')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Domain part of an address, so the test output never shows a local part.
+fn domain_of(address: &str) -> &str {
+    address.rsplit_once('@').map_or("(no domain)", |(_, d)| d)
+}
+
+/// EmailSubmission/set for real: sends ONE plain-text message to the address
+/// in STALWART_TEST_SEND_TO, from the login name as the `mail_send` tool does.
+/// Afterwards the sent copy (and only that id) is removed from Sent.
+#[tokio::test]
+#[ignore = "requires running Stalwart instance"]
+async fn test_send_email() {
+    let Ok(send_to) = std::env::var("STALWART_TEST_SEND_TO") else {
+        eprintln!("skipped: set STALWART_TEST_SEND_TO to send one real test message");
+        return;
+    };
+    let Some(config) = test_config() else {
+        eprintln!("skipped: STALWART_TEST_URL and STALWART_TEST_USER not set");
+        return;
+    };
+    let client = connect(&config).await;
+    let subject = unique_subject("send");
+    let from = self_address(&config);
+    let to = [send_to];
+
+    let id = ok(
+        "Email/set + EmailSubmission/set (send_email)",
+        client
+            .send_email(&ComposeEmail {
+                from: &from,
+                to: &to,
+                subject: &subject,
+                body: "Automated stalwart-mcp integration test message. Safe to delete.",
+                ..Default::default()
+            })
+            .await,
+    );
+    eprintln!("sent one message, stored as {id} with subject {subject:?}");
+
+    let outcome = sent_checks(&client, &from, &id, &subject).await;
+    let cleaned = cleanup(&client, &id, &subject).await;
+    if let Err(msg) = outcome {
+        panic!("{msg} ({cleaned:?})");
+    }
+    match cleaned {
+        Ok(1) => eprintln!("removed the sent copy {id} from Sent"),
+        other => panic!("cleanup of the sent copy {id} failed: {other:?}"),
+    }
+}
+
+async fn sent_checks(
+    client: &JmapClient,
+    from: &str,
+    id: &str,
+    subject: &str,
+) -> Result<(), String> {
+    if is_creation_id(id) {
+        return Err(format!(
+            "send_email returned the creation id {id}, not a server id"
+        ));
+    }
+
+    let detail = client
+        .get_email(id)
+        .await
+        .map_err(|e| format!("Email/get of the sent id {id} failed: {e}"))?;
+    if detail.subject.as_deref() != Some(subject) {
+        return Err(format!("Email/get subject mismatch: {:?}", detail.subject));
+    }
+
+    let sent = client
+        .resolve_mailbox_by_role("Sent")
+        .await
+        .map_err(|e| format!("Mailbox/get failed: {e}"))?
+        .ok_or("no Sent mailbox by role")?;
+    let drafts = client
+        .resolve_mailbox_by_role("Drafts")
+        .await
+        .map_err(|e| format!("Mailbox/get failed: {e}"))?
+        .ok_or("no Drafts mailbox by role")?;
+
+    // mailboxIds, keywords and from are not in EmailDetail: ask the server.
+    let raw = client
+        .raw()
+        .map_err(|e| format!("raw JMAP client setup failed: {e}"))?;
+    let response = raw
+        .call(
+            &["urn:ietf:params:jmap:mail"],
+            "Email/get",
+            serde_json::json!({
+                "accountId": raw.account_id(),
+                "ids": [id],
+                "properties": ["mailboxIds", "keywords", "from"],
+            }),
+        )
+        .await
+        .map_err(|e| format!("Email/get mailboxIds/keywords failed: {e}"))?;
+    let email = &response["list"][0];
+    if email["mailboxIds"][sent.as_str()] != serde_json::json!(true) {
+        return Err(format!(
+            "{id} is not in Sent: mailboxIds={}",
+            email["mailboxIds"]
+        ));
+    }
+    let keywords = email["keywords"].as_object().cloned().unwrap_or_default();
+    if keywords.contains_key("$draft") {
+        return Err(format!("{id} still carries $draft: {:?}", keywords.keys()));
+    }
+
+    // send_email puts the matching (else the first) identity's address in From.
+    let identities = client
+        .list_identities()
+        .await
+        .map_err(|e| format!("Identity/get failed: {e}"))?;
+    let expected = identities
+        .iter()
+        .find(|i| i.email.eq_ignore_ascii_case(from))
+        .or_else(|| identities.first())
+        .map(|i| i.email.as_str())
+        .ok_or("Identity/get returned no identity")?;
+    let actual = email["from"][0]["email"].as_str().unwrap_or_default();
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(format!(
+            "From is at {} but the identity is at {}",
+            domain_of(actual),
+            domain_of(expected)
+        ));
+    }
+    eprintln!("From is the identity address at {}", domain_of(actual));
+
+    // Nothing with this subject may be left in Drafts.
+    let left: Vec<String> = client
+        .list_recent_emails(Some(&drafts), SWEEP_LIMIT, false, None, None, None)
+        .await
+        .map_err(|e| format!("Email/query in Drafts failed: {e}"))?
+        .into_iter()
+        .filter(|e| e.subject.as_deref() == Some(subject))
+        .map(|e| e.id)
+        .collect();
+    if !left.is_empty() {
+        return Err(format!("Drafts still holds {left:?} with the test subject"));
     }
     Ok(())
 }

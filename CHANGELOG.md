@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.1.1-2] - 2026-11-20
+
+### Fixed
+- `mail_send` uses the sending identity's address as From instead of the login name (a plain login name is not a valid From and does not match the identity the server submits as). It picks the identity whose address matches the account's username, else the first one.
+- `mail_send` returns the id of the sent email in Sent, not the EmailSubmission id, and reports a rejected submission with the server's reason. A copy stored in Sent whose submission was rejected is removed again.
+
 ## [1.1.1-1] - 2026-11-20
 
 Tested against Stalwart 1.1.1.

@@ -1,7 +1,9 @@
 use crate::error::AppError;
 use crate::jmap::JmapClient;
 use jmap_client::core::query::Filter;
-use jmap_client::core::response::{EmailSetResponse, EmailSubmissionSetResponse};
+use jmap_client::core::response::{
+    EmailSetResponse, EmailSubmissionSetResponse, TaggedMethodResponse,
+};
 use jmap_client::core::set::SetObject;
 use jmap_client::email;
 use jmap_client::mailbox;
@@ -66,6 +68,7 @@ pub struct SearchFilters<'a> {
 
 #[derive(Debug, Default)]
 pub struct ComposeEmail<'a> {
+    /// From address for drafts; for `send_email` only the preferred identity.
     pub from: &'a str,
     pub to: &'a [String],
     pub cc: &'a [String],
@@ -414,7 +417,11 @@ impl JmapClient {
         created_email_id(&mut response, &create_id)
     }
 
-    /// Send an email via EmailSubmission
+    /// Send an email via EmailSubmission and return the server id of the copy
+    /// stored in Sent (no `$draft` keyword). It is sent as the identity whose
+    /// email matches `compose.from`, else the account's first identity, and
+    /// that identity's address becomes the From header. If the submission is
+    /// rejected, the stored copy is destroyed again.
     pub async fn send_email(&self, compose: &ComposeEmail<'_>) -> Result<String, AppError> {
         // Find the Sent mailbox
         let sent_id = self
@@ -430,21 +437,30 @@ impl JmapClient {
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
 
-        let identity_id = identity_response
+        let identities: Vec<SendingIdentity<'_>> = identity_response
             .list()
-            .first()
-            .and_then(|i| i.id())
-            .ok_or_else(|| AppError::JmapRequest("No identity found for sending".into()))?
-            .to_string();
+            .iter()
+            .filter_map(|i| {
+                Some(SendingIdentity {
+                    id: i.id()?,
+                    email: i.email()?,
+                    name: i.name(),
+                })
+            })
+            .collect();
+        let identity = pick_identity(&identities, compose.from)
+            .ok_or_else(|| AppError::JmapRequest("No identity found for sending".into()))?;
 
         let mut request = self.client.build();
 
-        // Create the email in Sent
+        // Create the email in Sent. The From header is the identity's address:
+        // the server matches the submission's sender against the identity, and
+        // `compose.from` may be a plain login name.
         let email = request.set_email().account_id(&self.account_id).create();
         email
             .mailbox_ids([&sent_id])
             .keywords(["$seen"])
-            .from([compose.from])
+            .from([identity.sender_address()])
             .to(compose.to.iter().map(|a| a.as_str()))
             .subject(compose.subject)
             .body_value("1".to_string(), compose.body)
@@ -468,18 +484,37 @@ impl JmapClient {
             .create();
 
         submission
-            .identity_id(&identity_id)
+            .identity_id(identity.id)
             .email_id(format!("#{email_create_id}"));
         let submission_create_id = creation_id(submission.create_id())?;
 
-        // send_set_email_submission returns the last method response, the
-        // EmailSubmission/set one
-        let mut response = request
-            .send_set_email_submission()
+        // Both method responses are needed: Email/set carries the email id,
+        // EmailSubmission/set says whether it was actually submitted.
+        // (send_set_email_submission would parse both as EmailSubmission/set.)
+        let response = request
+            .send()
             .await
             .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+        let (email_id, submitted) = split_send_responses(
+            response.unwrap_method_responses(),
+            &email_create_id,
+            &submission_create_id,
+        );
+        let email_id = email_id?;
 
-        created_submission_id(&mut response, &submission_create_id)
+        if let Err(e) = submitted {
+            // The copy in Sent was stored but never submitted: remove it.
+            return Err(
+                match self.bulk_destroy(std::slice::from_ref(&email_id)).await {
+                    Ok(_) => e,
+                    Err(cleanup) => AppError::JmapRequest(format!(
+                        "{e}; the unsent copy {email_id} could not be removed from Sent: {cleanup}"
+                    )),
+                },
+            );
+        }
+
+        Ok(email_id)
     }
 
     /// Get the Message-ID header of an email (for reply threading)
@@ -728,6 +763,58 @@ fn created_submission_id(
     non_empty_id(id, "EmailSubmission/set")
 }
 
+/// A sending identity from `Identity/get`, reduced to what `send_email` needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SendingIdentity<'a> {
+    id: &'a str,
+    email: &'a str,
+    name: Option<&'a str>,
+}
+
+impl SendingIdentity<'_> {
+    /// The From address: the identity's email, with its display name if set.
+    fn sender_address(&self) -> email::EmailAddress {
+        match self.name.filter(|n| !n.trim().is_empty()) {
+            Some(name) => (name, self.email).into(),
+            None => self.email.into(),
+        }
+    }
+}
+
+/// The identity whose email matches `preferred` (case-insensitive), else the
+/// first one. `preferred` is often a login name, which matches no identity.
+fn pick_identity<'a>(
+    identities: &[SendingIdentity<'a>],
+    preferred: &str,
+) -> Option<SendingIdentity<'a>> {
+    identities
+        .iter()
+        .find(|i| i.email.eq_ignore_ascii_case(preferred))
+        .or_else(|| identities.first())
+        .copied()
+}
+
+/// Split the `[Email/set, EmailSubmission/set]` responses of a send into the
+/// created email id and the created submission id.
+fn split_send_responses(
+    responses: Vec<TaggedMethodResponse>,
+    email_create_id: &str,
+    submission_create_id: &str,
+) -> (Result<String, AppError>, Result<String, AppError>) {
+    let mut responses = responses.into_iter();
+    let email_id = responses
+        .next()
+        .ok_or_else(|| AppError::JmapRequest("Email/set returned no response".into()))
+        .and_then(|r| r.unwrap_set_email().map_err(set_error))
+        .and_then(|mut r| created_email_id(&mut r, email_create_id));
+    let submitted = responses
+        .next()
+        .ok_or_else(|| AppError::JmapRequest("EmailSubmission/set returned no response".into()))
+        .and_then(|r| r.unwrap_set_email_submission().map_err(set_error))
+        .and_then(|mut r| created_submission_id(&mut r, submission_create_id));
+    (email_id, submitted)
+}
+
 fn non_empty_id(id: String, method: &str) -> Result<String, AppError> {
     if id.is_empty() {
         Err(AppError::JmapRequest(format!(
@@ -814,6 +901,91 @@ mod set_response_tests {
             created_submission_id(&mut response, "c0").expect("created"),
             "sub-7"
         );
+    }
+
+    fn send_responses(json: &str) -> Vec<TaggedMethodResponse> {
+        serde_json::from_str::<jmap_client::core::response::Response<TaggedMethodResponse>>(json)
+            .expect("valid JMAP response")
+            .unwrap_method_responses()
+    }
+
+    const SENT: &str = r#"{"sessionState":"x","methodResponses":[
+        ["Email/set",{"accountId":"a","newState":"s1",
+            "created":{"c0":{"id":"m42","blobId":"b1","threadId":"t1","size":120}}},"s0"],
+        ["EmailSubmission/set",{"accountId":"a","newState":"s2",
+            "created":{"c0":{"id":"sub-7"}}},"s1"]]}"#;
+
+    #[test]
+    fn send_returns_the_email_id_not_the_submission_id() {
+        let (email_id, submitted) = split_send_responses(send_responses(SENT), "c0", "c0");
+        assert_eq!(email_id.expect("email"), "m42");
+        assert_eq!(submitted.expect("submission"), "sub-7");
+    }
+
+    #[test]
+    fn send_surfaces_a_rejected_submission() {
+        let json = r#"{"sessionState":"x","methodResponses":[
+            ["Email/set",{"accountId":"a","newState":"s1",
+                "created":{"c0":{"id":"m42","blobId":"b1","threadId":"t1","size":120}}},"s0"],
+            ["EmailSubmission/set",{"accountId":"a","newState":"s2","created":null,
+                "notCreated":{"c0":{"type":"forbidden","description":"sender mismatch"}}},"s1"]]}"#;
+        let (email_id, submitted) = split_send_responses(send_responses(json), "c0", "c0");
+        assert_eq!(email_id.expect("email"), "m42");
+        let err = submitted.expect_err("rejected");
+        assert!(err.to_string().contains("sender mismatch"), "{err}");
+    }
+
+    #[test]
+    fn send_surfaces_a_rejected_email_and_missing_responses() {
+        let json = r#"{"sessionState":"x","methodResponses":[
+            ["Email/set",{"accountId":"a","newState":"s1","created":null,
+                "notCreated":{"c0":{"type":"invalidProperties","description":"bad from"}}},"s0"],
+            ["error",{"type":"invalidArguments","description":"unresolved #c0"},"s1"]]}"#;
+        let (email_id, submitted) = split_send_responses(send_responses(json), "c0", "c0");
+        assert!(
+            email_id
+                .expect_err("rejected")
+                .to_string()
+                .contains("bad from")
+        );
+        assert!(submitted.is_err());
+
+        let (email_id, submitted) = split_send_responses(Vec::new(), "c0", "c0");
+        assert!(email_id.is_err() && submitted.is_err());
+    }
+
+    const ALICE: SendingIdentity<'static> = SendingIdentity {
+        id: "i1",
+        email: "alice@example.com",
+        name: Some("Alice"),
+    };
+    const SALES: SendingIdentity<'static> = SendingIdentity {
+        id: "i2",
+        email: "sales@example.com",
+        name: Some(" "),
+    };
+
+    #[test]
+    fn identity_matches_the_preferred_address_else_the_first() {
+        let ids = [ALICE, SALES];
+        assert_eq!(pick_identity(&ids, "Sales@Example.com"), Some(SALES));
+        // A plain login name matches no identity: fall back to the first.
+        assert_eq!(pick_identity(&ids, "alice"), Some(ALICE));
+        assert_eq!(pick_identity(&[], "alice"), None);
+    }
+
+    #[test]
+    fn sender_address_is_the_identity_email() {
+        let json = |a: email::EmailAddress| serde_json::to_value(a).expect("serializable");
+        assert_eq!(
+            json(ALICE.sender_address()),
+            serde_json::json!({"name": "Alice", "email": "alice@example.com"})
+        );
+        assert_eq!(
+            json(SALES.sender_address())["email"],
+            serde_json::json!("sales@example.com")
+        );
+        assert!(json(SALES.sender_address())["name"].is_null());
     }
 
     #[test]

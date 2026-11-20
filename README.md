@@ -84,7 +84,7 @@ To pick a build for your server, take the newest tag whose first three numbers a
 
 Test coverage for `1.0.3-1`: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3.
 
-Test coverage for `1.1.1-1`, run live against Stalwart 1.1.1 (`tests/integration_mail.rs` and `tests/integration_account.rs`): connect and session capabilities; mailbox listing and role lookup; recent listing, search, full message, raw blob and Message-ID reads; the draft lifecycle (create, search, read/unread, move to Trash, permanent delete); masked email list, create, disable and destroy; vacation response get, set (disabled only) and restore; `Quota/get` (on an account without a disk quota, so an empty list) and `Identity/get`. Not run live: `mail_send` (EmailSubmission), `spam_train` (`SpamTrainingSample/set`), an enabled vacation response, and the masked address quota error.
+Test coverage for `1.1.1-1`, run live against Stalwart 1.1.1 (`tests/integration_mail.rs` and `tests/integration_account.rs`): connect and session capabilities; mailbox listing and role lookup; recent listing, search, full message, raw blob and Message-ID reads; the draft lifecycle (create, search, read/unread, move to Trash, permanent delete); masked email list, create, disable and destroy; vacation response get, set (disabled only) and restore; `Quota/get` (on an account without a disk quota, so an empty list) and `Identity/get`; `mail_send` (`Email/set` plus `EmailSubmission/set`, one real message, with the fixes from `1.1.1-2`). Not run live: `spam_train` (`SpamTrainingSample/set`), an enabled vacation response, and the masked address quota error.
 
 ## Installation
 
@@ -286,6 +286,13 @@ cargo test --locked -- --ignored --test-threads=1
 ```
 
 The account tests (`tests/integration_account.rs`) write to the account and restore it: they create, disable and destroy one masked address, and set a disabled vacation response before putting the prior one back. They skip the vacation write when an auto-reply is active.
+
+The send test (`test_send_email` in `tests/integration_mail.rs`) sends one real plain-text message per run and is skipped unless `STALWART_TEST_SEND_TO` names the recipient; it checks that the copy lands in Sent without `$draft` and with the identity's address as From, then removes that copy. Keep the address in your environment, never in the repo:
+
+```bash
+export STALWART_TEST_SEND_TO="someone-who-agreed@example.com"
+cargo test --locked --test integration_mail test_send_email -- --ignored --nocapture
+```
 
 ## Architecture
 
