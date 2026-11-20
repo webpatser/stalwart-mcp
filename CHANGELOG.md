@@ -7,6 +7,7 @@
 - Removed `[admin_api]` config section and the `STALWART_ADMIN_PASSWORD` environment variable; no longer needed.
 - `spam_train` no longer downloads raw email bodies locally; the server fetches each email's existing JMAP blob directly.
 - HTTP mode refuses to start when `server.allowed_hosts` is set without `auth.secret`, so a same-host reverse proxy cannot bypass JWT auth.
+- Updated compatible dependencies, added `rust-version`, sorted the manifest, fixed the repository URL, and CI now builds with `--locked` and runs the tests.
 
 ### Compatibility
 - Requires Stalwart v0.16.x or later for `spam_train`.
