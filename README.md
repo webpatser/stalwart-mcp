@@ -57,6 +57,18 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 - A running [Stalwart Mail Server](https://stalw.art/) with JMAP enabled
 - Stalwart v0.16+ for `spam_train` (other tools are compatible with v0.15+)
 
+## Versioning
+
+Releases are numbered `<stalwart version>-<mcp revision>`. The first three numbers are the Stalwart Mail Server release the build was tested against; the number after the hyphen counts MCP-only releases on that Stalwart version. For example, `1.0.3-2` follows `1.0.3-1` on the same Stalwart, and `1.0.4-1` follows when Stalwart's API changes in 1.0.4. (Cargo requires three-part semver, hence `1.0.3-1` rather than `1.0.3.1`.) Releases before `1.0.3-1` (0.1.x, 0.2.0) keep their old numbers.
+
+To pick a build for your server, take the newest tag whose first three numbers are at or below your Stalwart version.
+
+| stalwart-mcp | Stalwart |
+|--------------|----------|
+| `1.0.3-1`    | 1.0.3    |
+
+Test coverage: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3. `spam_train` over JMAP (`SpamTrainingSample/set`) has not yet been verified on a live 1.x server.
+
 ## Installation
 
 ```bash

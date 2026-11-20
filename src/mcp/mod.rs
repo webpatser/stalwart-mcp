@@ -17,6 +17,14 @@ use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, prompt_handler, tool_handler};
 use std::sync::Arc;
 
+/// Server identity reported to MCP clients: this crate's name and version.
+///
+/// `Implementation::from_build_env()` would report rmcp's own name and
+/// version, because its `env!` calls expand inside the rmcp crate.
+fn server_implementation() -> Implementation {
+    Implementation::new(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"))
+}
+
 #[derive(Clone)]
 pub struct StalwartMcp {
     pub(crate) accounts: Arc<AccountManager>,
@@ -63,7 +71,7 @@ impl ServerHandler for StalwartMcp {
                 .enable_resources()
                 .build(),
         )
-        .with_server_info(Implementation::from_build_env())
+        .with_server_info(server_implementation())
     }
 
     async fn list_resources(
@@ -128,5 +136,17 @@ impl ServerHandler for StalwartMcp {
         let contents = ResourceContents::text(json, uri.clone()).with_mime_type("application/json");
 
         Ok(ReadResourceResult::new(vec![contents]).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_info_reports_this_crate() {
+        let info = server_implementation();
+        assert_eq!(info.name, env!("CARGO_PKG_NAME"));
+        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
     }
 }

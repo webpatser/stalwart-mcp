@@ -7,7 +7,11 @@ use stalwart_mcp::jmap::AccountManager;
 use stalwart_mcp::mcp::StalwartMcp;
 
 #[derive(Parser)]
-#[command(name = "stalwart-mcp", about = "MCP server for Stalwart Mail Server")]
+#[command(
+    name = "stalwart-mcp",
+    version,
+    about = "MCP server for Stalwart Mail Server"
+)]
 struct Cli {
     /// Path to config file (default: ~/.config/stalwart-mcp/config.toml)
     #[arg(short, long, global = true)]
