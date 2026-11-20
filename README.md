@@ -99,6 +99,7 @@ password_env = "STALWART_PASSWORD_WORK"
 [server]
 # For HTTP behind a reverse proxy, allow its public hostname (optionally with port).
 # Omit or leave empty to retain rmcp's localhost/127.0.0.1/::1 defaults.
+# Setting this requires auth.secret; HTTP mode refuses to start without it.
 # allowed_hosts = ["mcp.example.com"]
 
 [auth]
@@ -200,7 +201,7 @@ Then configure your client to connect via HTTP:
 }
 ```
 
-**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, only loopback requests are allowed. For a reverse proxy, configure `auth.secret` even when the server binds to loopback. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
+**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, only loopback requests are allowed. Because a reverse proxy on the same host makes every request look like loopback, HTTP mode refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
 
 ## Example interactions
 

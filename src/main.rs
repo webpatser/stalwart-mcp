@@ -71,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Serve { stdio: _, bind } => {
+            // Fail fast, before connecting accounts or binding the HTTP listener
+            config.validate(bind.is_some())?;
+
             // Connect all accounts to Stalwart via JMAP
             let manager =
                 AccountManager::connect_all(&config.accounts, config.default_account.as_deref())

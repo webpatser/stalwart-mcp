@@ -6,6 +6,7 @@
 - **BREAKING:** `spam_train` now calls Stalwart v0.16's JMAP `SpamTrainingSample/set` method instead of the removed `/api/spam-filter/upload/*` REST endpoints. Training runs under the user's own account credentials.
 - Removed `[admin_api]` config section and the `STALWART_ADMIN_PASSWORD` environment variable; no longer needed.
 - `spam_train` no longer downloads raw email bodies locally; the server fetches each email's existing JMAP blob directly.
+- HTTP mode refuses to start when `server.allowed_hosts` is set without `auth.secret`, so a same-host reverse proxy cannot bypass JWT auth.
 
 ### Compatibility
 - Requires Stalwart v0.16.x or later for `spam_train`.

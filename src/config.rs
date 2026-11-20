@@ -101,6 +101,14 @@ pub struct AuthConfig {
     pub secret: Option<String>,
 }
 
+impl AuthConfig {
+    /// True when a non-empty secret is configured. Matches the auth middleware,
+    /// which treats a missing secret and `""` the same way (loopback bypass).
+    pub fn has_secret(&self) -> bool {
+        self.secret.as_deref().is_some_and(|s| !s.is_empty())
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -125,6 +133,80 @@ impl AppConfig {
             .map_err(|e| crate::error::AppError::Config(e.to_string()))?;
 
         Ok(config)
+    }
+
+    /// Validate the merged config before serving. `http` is true for the HTTP transport.
+    ///
+    /// Refuses HTTP mode with `server.allowed_hosts` set and no `auth.secret`: a reverse
+    /// proxy on the same host makes every request look like loopback, which the auth
+    /// middleware lets through without a token when no secret is configured.
+    pub fn validate(&self, http: bool) -> Result<(), crate::error::AppError> {
+        if http && !self.server.allowed_hosts.is_empty() && !self.auth.has_secret() {
+            return Err(crate::error::AppError::Config(
+                "server.allowed_hosts is set but auth.secret is empty; behind a reverse proxy \
+                 every request would look like loopback and skip authentication. Set auth.secret \
+                 (run `stalwart-mcp token create` to generate one) or remove server.allowed_hosts"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(allowed_hosts: Vec<String>, secret: Option<&str>) -> AppConfig {
+        AppConfig {
+            accounts: Vec::new(),
+            default_account: None,
+            server: ServerConfig {
+                allowed_hosts,
+                ..Default::default()
+            },
+            capabilities: Capabilities::default(),
+            notifications: NotificationsConfig::default(),
+            auth: AuthConfig {
+                secret: secret.map(str::to_string),
+            },
+        }
+    }
+
+    #[test]
+    fn validate_refuses_allowed_hosts_without_secret() {
+        for secret in [None, Some("")] {
+            let err = config(vec!["mcp.example.com".into()], secret)
+                .validate(true)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("server.allowed_hosts"), "{err}");
+            assert!(err.contains("auth.secret"), "{err}");
+        }
+    }
+
+    #[test]
+    fn validate_passes_allowed_hosts_with_secret() {
+        assert!(
+            config(vec!["mcp.example.com".into()], Some("s3cret"))
+                .validate(true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_passes_empty_allowed_hosts_without_secret() {
+        assert!(config(Vec::new(), None).validate(true).is_ok());
+        assert!(config(Vec::new(), Some("")).validate(true).is_ok());
+    }
+
+    #[test]
+    fn validate_ignores_allowed_hosts_for_stdio() {
+        assert!(
+            config(vec!["mcp.example.com".into()], None)
+                .validate(false)
+                .is_ok()
+        );
     }
 }
 
