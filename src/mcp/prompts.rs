@@ -1,6 +1,6 @@
 use crate::mcp::StalwartMcp;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{PromptMessage, PromptMessageRole};
+use rmcp::model::{PromptMessage, Role};
 use rmcp::{prompt, prompt_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -48,11 +48,11 @@ impl StalwartMcp {
     async fn triage_inbox(&self) -> Vec<PromptMessage> {
         vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 "Triage my inbox. Show me what needs attention.".to_string(),
             ),
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 concat!(
                     "I'll triage your inbox now. Here's my approach:\n\n",
                     "1. First, I'll fetch your recent unread emails using `mail_list_recent` with `unread_only: true`\n",
@@ -88,14 +88,14 @@ impl StalwartMcp {
 
         vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!(
                     "Draft a {tone} reply to message ID: {}{account_hint}",
                     args.message_id
                 ),
             ),
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 format!(
                     concat!(
                         "I'll draft a {tone} reply. Here's my approach:\n\n",
@@ -133,14 +133,14 @@ impl StalwartMcp {
 
         vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!(
                     "Search for \"{}\"{account_hint} and summarize what you find.",
                     args.query
                 ),
             ),
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 format!(
                     concat!(
                         "I'll search and summarize. Here's my approach:\n\n",
@@ -180,13 +180,13 @@ impl StalwartMcp {
 
         vec![
             PromptMessage::new_text(
-                PromptMessageRole::User,
+                Role::User,
                 format!(
                     "Train my spam filter by reviewing up to {limit} emails in '{folder}'{account_hint}."
                 ),
             ),
             PromptMessage::new_text(
-                PromptMessageRole::Assistant,
+                Role::Assistant,
                 format!(
                     concat!(
                         "I'll train your spam filter. Here's my approach:\n\n",

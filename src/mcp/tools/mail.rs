@@ -1,7 +1,7 @@
 use crate::jmap::mail::{ComposeEmail, SearchFilters};
 use crate::mcp::StalwartMcp;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::{ErrorData, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -206,7 +206,7 @@ impl StalwartMcp {
         let json = serde_json::to_string_pretty(&mailboxes)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(description = "List recent emails in a folder, optionally filtered to unread only")]
@@ -250,7 +250,7 @@ impl StalwartMcp {
         let json = serde_json::to_string_pretty(&emails)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -315,7 +315,7 @@ impl StalwartMcp {
         let json = serde_json::to_string_pretty(&emails)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -338,7 +338,7 @@ impl StalwartMcp {
         let json = serde_json::to_string_pretty(&email)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 
     #[tool(
@@ -409,7 +409,7 @@ impl StalwartMcp {
             }
         }
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Email {} marked as {}",
             args.id, args.action
         ))]))
@@ -439,7 +439,7 @@ impl StalwartMcp {
             .await
             .map_err(ErrorData::from)?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Email {} moved to {}",
             args.id, args.folder
         ))]))
@@ -486,7 +486,7 @@ impl StalwartMcp {
             .await
             .map_err(ErrorData::from)?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Draft saved with ID: {draft_id}"
         ))]))
     }
@@ -542,7 +542,7 @@ impl StalwartMcp {
             .await
             .map_err(ErrorData::from)?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "Email sent successfully (ID: {email_id})"
         ))]))
     }
@@ -596,7 +596,7 @@ impl StalwartMcp {
             .await
             .map_err(ErrorData::from)?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "{count} emails marked as {action_label}"
         ))]))
     }
@@ -631,7 +631,7 @@ impl StalwartMcp {
             .await
             .map_err(ErrorData::from)?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "{count} emails permanently deleted"
         ))]))
     }
@@ -666,7 +666,7 @@ impl StalwartMcp {
             .await
             .map_err(ErrorData::from)?;
 
-        Ok(CallToolResult::success(vec![Content::text(format!(
+        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
             "{count} emails marked as read"
         ))]))
     }
@@ -735,6 +735,6 @@ impl StalwartMcp {
         let json = serde_json::to_string_pretty(&result)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
-        Ok(CallToolResult::success(vec![Content::text(json)]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
     }
 }

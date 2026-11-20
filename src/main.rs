@@ -207,8 +207,14 @@ fn http_router(
     use stalwart_mcp::auth::AuthSecret;
     use std::sync::Arc;
 
+    // Request bodies are capped at 2 MB. `DefaultBodyLimit` only governs axum extractors,
+    // and the rmcp service reads the body itself, so its own limit is set to match.
+    const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
     let mut transport_config =
-        rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+        rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+            .with_max_request_body_bytes(MAX_BODY_BYTES);
+    // Empty keeps rmcp's loopback-only Host default; a non-empty list replaces it.
     if !server_config.allowed_hosts.is_empty() {
         transport_config = transport_config.with_allowed_hosts(server_config.allowed_hosts.clone());
     }
@@ -223,7 +229,7 @@ fn http_router(
 
     Router::new()
         .nest_service("/mcp", service)
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn(
             stalwart_mcp::auth::auth_middleware,
         ))
