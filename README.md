@@ -213,7 +213,7 @@ Then configure your client to connect via HTTP:
 }
 ```
 
-**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, only loopback requests are allowed. Because a reverse proxy on the same host makes every request look like loopback, HTTP mode refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
+**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, every request arriving from loopback is trusted and all others are rejected. A reverse proxy on the same host makes every request arrive from loopback, so without a secret it exposes the server unauthenticated. HTTP mode refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty, but it cannot detect a proxy: with `allowed_hosts` unset, a proxy that forwards a loopback Host (nginx `proxy_pass http://127.0.0.1:3000` does by default) still gets through. Always set `auth.secret` when the server sits behind a reverse proxy or is reachable by anything other than local clients. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
 
 ## Example interactions
 

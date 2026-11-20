@@ -10,7 +10,7 @@ Versioning change: releases are now numbered `<stalwart version>-<mcp revision>`
 - **BREAKING:** `spam_train` now calls Stalwart v0.16's JMAP `SpamTrainingSample/set` method instead of the removed `/api/spam-filter/upload/*` REST endpoints. Training runs under the user's own account credentials.
 - Removed `[admin_api]` config section and the `STALWART_ADMIN_PASSWORD` environment variable; no longer needed.
 - `spam_train` no longer downloads raw email bodies locally; the server fetches each email's existing JMAP blob directly.
-- HTTP mode refuses to start when `server.allowed_hosts` is set without `auth.secret`, so a same-host reverse proxy cannot bypass JWT auth.
+- HTTP mode refuses to start when `server.allowed_hosts` is set without `auth.secret`. This does not detect proxies: without a secret, a same-host reverse proxy that forwards a loopback Host is still trusted, so set `auth.secret` behind any proxy.
 - Updated compatible dependencies, added `rust-version`, sorted the manifest, fixed the repository URL, and CI now builds with `--locked` and runs the tests.
 - Upgraded `jsonwebtoken` to 12 (still on the `aws_lc_rs` backend); existing tokens stay valid, and `token create` now errors on an empty `auth.secret` instead of signing with an empty key.
 - Upgraded `rmcp` to 3.11 and `axum` to 0.8; tool, prompt and resource definitions are unchanged, and the 2 MB request body cap now also applies inside the MCP transport.
