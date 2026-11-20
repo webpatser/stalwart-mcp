@@ -6,6 +6,7 @@ use jmap_client::core::response::{
 };
 use jmap_client::core::set::SetObject;
 use jmap_client::email;
+use jmap_client::identity::Identity;
 use jmap_client::mailbox;
 use serde::Serialize;
 
@@ -68,7 +69,8 @@ pub struct SearchFilters<'a> {
 
 #[derive(Debug, Default)]
 pub struct ComposeEmail<'a> {
-    /// From address for drafts; for `send_email` only the preferred identity.
+    /// The preferred identity's email; the From header is always the address
+    /// of the identity picked from it (often a login name, matching none).
     pub from: &'a str,
     pub to: &'a [String],
     pub cc: &'a [String],
@@ -378,13 +380,28 @@ impl JmapClient {
         destroyed_count(&mut response)
     }
 
-    /// Create a draft email
+    /// The identity to send as: the one whose email matches `preferred`, else
+    /// the account's first identity (`Identity/get`).
+    async fn sender(&self, preferred: &str) -> Result<Sender, AppError> {
+        let mut request = self.client.build();
+        request.get_identity();
+        let identity_response = request
+            .send_get_identity()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+        sender_from(identity_response.list(), preferred)
+    }
+
+    /// Create a draft in Drafts and return its server id. Its From header is
+    /// the address of the identity `send_email` would use, because
+    /// `compose.from` may be a plain login name.
     pub async fn create_draft(&self, compose: &ComposeEmail<'_>) -> Result<String, AppError> {
         // Find the Drafts mailbox
         let drafts_id = self
             .resolve_special_mailbox("Drafts")
             .await?
             .ok_or_else(|| AppError::NotFound("Drafts mailbox not found".into()))?;
+        let sender = self.sender(compose.from).await?;
 
         let mut request = self.client.build();
         let email = request.set_email().account_id(&self.account_id).create();
@@ -392,7 +409,7 @@ impl JmapClient {
         email
             .mailbox_ids([&drafts_id])
             .keywords(["$draft", "$seen"])
-            .from([compose.from])
+            .from([sender.address])
             .to(compose.to.iter().map(|a| a.as_str()))
             .subject(compose.subject)
             .body_value("1".to_string(), compose.body)
@@ -429,27 +446,7 @@ impl JmapClient {
             .await?
             .ok_or_else(|| AppError::NotFound("Sent mailbox not found".into()))?;
 
-        // Get identity ID by listing all identities
-        let mut request = self.client.build();
-        request.get_identity();
-        let identity_response = request
-            .send_get_identity()
-            .await
-            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
-
-        let identities: Vec<SendingIdentity<'_>> = identity_response
-            .list()
-            .iter()
-            .filter_map(|i| {
-                Some(SendingIdentity {
-                    id: i.id()?,
-                    email: i.email()?,
-                    name: i.name(),
-                })
-            })
-            .collect();
-        let identity = pick_identity(&identities, compose.from)
-            .ok_or_else(|| AppError::JmapRequest("No identity found for sending".into()))?;
+        let sender = self.sender(compose.from).await?;
 
         let mut request = self.client.build();
 
@@ -460,7 +457,7 @@ impl JmapClient {
         email
             .mailbox_ids([&sent_id])
             .keywords(["$seen"])
-            .from([identity.sender_address()])
+            .from([sender.address])
             .to(compose.to.iter().map(|a| a.as_str()))
             .subject(compose.subject)
             .body_value("1".to_string(), compose.body)
@@ -484,7 +481,7 @@ impl JmapClient {
             .create();
 
         submission
-            .identity_id(identity.id)
+            .identity_id(sender.identity_id)
             .email_id(format!("#{email_create_id}"));
         let submission_create_id = creation_id(submission.create_id())?;
 
@@ -794,6 +791,34 @@ fn pick_identity<'a>(
         .copied()
 }
 
+/// Who a draft or a sent email comes from.
+#[derive(Debug)]
+struct Sender {
+    identity_id: String,
+    address: email::EmailAddress,
+}
+
+/// The sender for `preferred` from an `Identity/get` list (see `pick_identity`).
+/// Identities without an id or email are skipped.
+fn sender_from(identities: &[Identity], preferred: &str) -> Result<Sender, AppError> {
+    let identities: Vec<SendingIdentity<'_>> = identities
+        .iter()
+        .filter_map(|i| {
+            Some(SendingIdentity {
+                id: i.id()?,
+                email: i.email()?,
+                name: i.name(),
+            })
+        })
+        .collect();
+    let identity = pick_identity(&identities, preferred)
+        .ok_or_else(|| AppError::JmapRequest("No identity found for sending".into()))?;
+    Ok(Sender {
+        identity_id: identity.id.to_string(),
+        address: identity.sender_address(),
+    })
+}
+
 /// Split the `[Email/set, EmailSubmission/set]` responses of a send into the
 /// created email id and the created submission id.
 fn split_send_responses(
@@ -986,6 +1011,34 @@ mod set_response_tests {
             serde_json::json!("sales@example.com")
         );
         assert!(json(SALES.sender_address())["name"].is_null());
+    }
+
+    #[test]
+    fn sender_from_identity_get_uses_the_identity_address() {
+        let identities: Vec<Identity> = serde_json::from_str(
+            r#"[{"id":"i0","name":"No email"},
+                {"id":"i1","name":"Alice","email":"alice@example.com"},
+                {"id":"i2","name":"","email":"sales@example.com"}]"#,
+        )
+        .expect("valid Identity/get list");
+        let json = |a: email::EmailAddress| serde_json::to_value(a).expect("serializable");
+
+        // A plain login name: the first identity with an email, never the login.
+        let sender = sender_from(&identities, "alice").expect("sender");
+        assert_eq!(sender.identity_id, "i1");
+        assert_eq!(
+            json(sender.address),
+            serde_json::json!({"name": "Alice", "email": "alice@example.com"})
+        );
+
+        let sender = sender_from(&identities, "SALES@example.com").expect("sender");
+        assert_eq!(sender.identity_id, "i2");
+        assert_eq!(
+            json(sender.address)["email"],
+            serde_json::json!("sales@example.com")
+        );
+
+        assert!(sender_from(&[], "alice").is_err());
     }
 
     #[test]

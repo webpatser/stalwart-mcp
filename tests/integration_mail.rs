@@ -466,6 +466,13 @@ async fn draft_steps(client: &JmapClient, id: &str, subject: &str) -> Result<(),
     if detail.subject.as_deref() != Some(subject) {
         return Err(format!("Email/get subject mismatch: {:?}", detail.subject));
     }
+    // From must be the identity's address, not the login name (not printed).
+    if detail.from.len() != 1 || !detail.from.iter().all(|f| f.contains('@')) {
+        return Err(format!(
+            "draft From is not one email address ({} entries)",
+            detail.from.len()
+        ));
+    }
     if !detail
         .text_body
         .as_deref()
