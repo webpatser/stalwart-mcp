@@ -7,6 +7,8 @@ pub mod spam_filter;
 use crate::config::AccountConfig;
 use crate::error::AppError;
 use jmap_client::client::Client;
+use reqwest::header::{AUTHORIZATION, HeaderMap};
+use reqwest::redirect::Policy;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,8 +18,31 @@ use spam_filter::SpamFilterClient;
 
 pub struct JmapClient {
     client: Client,
+    /// Shared by [`Self::raw`] and [`Self::spam_filter`]; carries the credentials.
+    api_http: reqwest::Client,
     account_id: String,
     username: String,
+}
+
+/// A copy of jmap-client's default headers with the Authorization value marked
+/// sensitive, so it is never printed by `Debug`.
+pub(crate) fn api_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut headers = headers.clone();
+    if let Some(value) = headers.get_mut(AUTHORIZATION) {
+        value.set_sensitive(true);
+    }
+    headers
+}
+
+/// HTTP client for JMAP API posts. Redirects are never followed, so a 307 or
+/// 308 cannot re-post a JMAP body (with its credentials) to another host.
+pub(crate) fn api_http_client(headers: HeaderMap) -> Result<reqwest::Client, AppError> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .redirect(Policy::none())
+        .default_headers(headers)
+        .build()
+        .map_err(|e| AppError::JmapConnection(format!("Failed to build JMAP HTTP client: {e}")))
 }
 
 impl JmapClient {
@@ -40,6 +65,7 @@ impl JmapClient {
 
         let account_id = client.default_account_id().to_string();
         let username = client.session().username().to_string();
+        let api_http = api_http_client(api_headers(client.headers()))?;
 
         tracing::info!(
             name = %config.name,
@@ -50,6 +76,7 @@ impl JmapClient {
 
         Ok(Self {
             client,
+            api_http,
             account_id,
             username,
         })
@@ -66,38 +93,26 @@ impl JmapClient {
     /// Build a Stalwart spam-filter client that shares this account's JMAP
     /// endpoint and Basic-auth credentials. Used by the `spam_train` tool to
     /// call `SpamTrainingSample/set` (Stalwart v0.16+).
+    ///
+    /// Shares the HTTP client built at connect time (no redirects followed).
     pub fn spam_filter(&self) -> Result<SpamFilterClient, AppError> {
-        let api_url = self.client.session().api_url().to_string();
-        let headers = self.client.headers().clone();
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .default_headers(headers)
-            .build()
-            .map_err(|e| {
-                AppError::JmapConnection(format!("Failed to build spam-filter HTTP client: {e}"))
-            })?;
-
         Ok(SpamFilterClient {
-            http,
-            api_url,
+            http: self.api_http.clone(),
+            api_url: self.client.session().api_url().to_string(),
             account_id: self.account_id.clone(),
         })
     }
 
     /// Build an untyped JMAP caller that shares this account's API URL and
     /// Basic-auth credentials. Used for masked email, vacation response, quota
-    /// and identity calls.
+    /// and identity calls. Shares the HTTP client built at connect time (no
+    /// redirects followed).
     pub fn raw(&self) -> Result<RawJmap, AppError> {
-        let api_url = self.client.session().api_url().to_string();
-        let headers = self.client.headers().clone();
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(30))
-            .default_headers(headers)
-            .build()
-            .map_err(|e| {
-                AppError::JmapConnection(format!("Failed to build JMAP HTTP client: {e}"))
-            })?;
-        Ok(RawJmap::new(http, api_url, self.account_id.clone()))
+        Ok(RawJmap::new(
+            self.api_http.clone(),
+            self.client.session().api_url().to_string(),
+            self.account_id.clone(),
+        ))
     }
 
     /// Start an EventSource stream for real-time change notifications.
@@ -135,8 +150,8 @@ impl JmapClient {
             }
         }
 
-        // Build HTTP/1.1-only client — critical for SSE streaming
-        let headers = self.client.headers().clone();
+        // Build HTTP/1.1-only client: critical for SSE streaming
+        let headers = api_headers(self.client.headers());
         let http_client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(30))
             .http1_only()

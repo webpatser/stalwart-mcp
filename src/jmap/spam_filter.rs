@@ -1,10 +1,12 @@
 use crate::error::AppError;
+use crate::jmap::raw::read_body_capped;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const STALWART_JMAP_CAPABILITY: &str = "urn:stalwart:jmap";
 const JMAP_CORE_CAPABILITY: &str = "urn:ietf:params:jmap:core";
+const SPAM_TRAINING_SET: &str = "SpamTrainingSample/set";
 
 /// Client for Stalwart v0.16's JMAP `SpamTrainingSample/set` method.
 ///
@@ -16,6 +18,16 @@ pub struct SpamFilterClient {
     pub(crate) http: Client,
     pub(crate) api_url: String,
     pub(crate) account_id: String,
+}
+
+/// Prints no HTTP client: its default headers carry the account credentials.
+impl std::fmt::Debug for SpamFilterClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpamFilterClient")
+            .field("api_url", &self.api_url)
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -73,18 +85,17 @@ impl SpamFilterClient {
                 AppError::JmapRequest(format!("SpamTrainingSample/set request failed: {e}"))
             })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "no body".to_string());
+        let status = response.status();
+        let body = read_body_capped(SPAM_TRAINING_SET, response).await?;
+
+        if !status.is_success() {
             return Err(AppError::JmapRequest(format!(
-                "SpamTrainingSample/set returned {status}: {body}"
+                "SpamTrainingSample/set returned {status}: {}",
+                String::from_utf8_lossy(&body)
             )));
         }
 
-        let body: JmapResponse = response.json().await.map_err(|e| {
+        let body: JmapResponse = serde_json::from_slice(&body).map_err(|e| {
             AppError::JmapRequest(format!(
                 "Invalid JSON response from SpamTrainingSample/set: {e}"
             ))
@@ -149,6 +160,22 @@ struct SetResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_does_not_print_credentials() {
+        let headers = crate::jmap::api_headers(&reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Basic c2VjcmV0LWNyZWRlbnRpYWw="),
+        )]));
+        let client = SpamFilterClient {
+            http: crate::jmap::api_http_client(headers).expect("client"),
+            api_url: "https://mail.example.com/jmap".into(),
+            account_id: "a1".into(),
+        };
+        let debug = format!("{client:?}");
+        assert!(!debug.contains("c2VjcmV0"), "{debug}");
+        assert!(!debug.to_lowercase().contains("authorization"), "{debug}");
+    }
 
     #[test]
     fn train_request_has_expected_shape() {

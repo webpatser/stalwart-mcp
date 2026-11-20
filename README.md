@@ -36,7 +36,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail_masked_create` | Create a server-generated masked address, optionally with a prefix, domain, description, site and expiry (requires `capabilities.masked_email = true`; the server limits the number per account) |
 | `mail_masked_disable` | Disable a masked address so mail to it is no longer delivered (requires `capabilities.masked_email = true`) |
 | `mail_vacation_get` | Get the vacation response (out-of-office auto-reply) |
-| `mail_vacation_set` | Replace the vacation response; omitted fields are cleared (requires `capabilities.vacation = true`) |
+| `mail_vacation_set` | Replace the whole vacation response; omitted fields are cleared. Enabling it makes the server auto-reply to anyone who mails the account, also after the MCP session ends, until `to_date`, so `to_date` is required when enabling (in the future, at most 90 days ahead) and the subject and body must not contain private data. Clients should call `mail_vacation_get` first and enable only on the user's explicit request. Subject at most 998 characters, each body at most 64 KiB (requires `capabilities.vacation = true`) |
 | `quota_get` | Storage quota usage and limits (`Quota/get`, RFC 9425) |
 | `identity_list` | Sending identities: From addresses, reply-to, bcc, signatures |
 
@@ -122,8 +122,9 @@ password_env = "STALWART_PASSWORD_WORK"
 # Allow creating and disabling masked email addresses (default: false, requires Stalwart 1.1+).
 # Listing them is always allowed.
 # masked_email = true
-# Allow changing the vacation response (default: false). When enabled, the server
-# sends auto-replies. Reading it is always allowed.
+# Allow changing the vacation response (default: false). An enabled response makes
+# the server auto-reply to every sender, also after the session ends, until its
+# to_date (required, at most 90 days ahead). Reading it is always allowed.
 # vacation = true
 
 [notifications]

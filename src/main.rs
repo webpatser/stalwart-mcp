@@ -61,7 +61,7 @@ enum TokenAction {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Init tracing — stderr only (stdout reserved for MCP stdio transport)
+    // Init tracing: stderr only (stdout reserved for MCP stdio transport)
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),

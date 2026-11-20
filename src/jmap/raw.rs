@@ -15,12 +15,65 @@ use serde_json::{Map, Value, json};
 pub const JMAP_CORE: &str = "urn:ietf:params:jmap:core";
 const CALL_ID: &str = "c0";
 
+/// Largest JMAP response body read into memory (8 MB).
+pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Shares the account's JMAP API URL and Basic-auth headers.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RawJmap {
     http: reqwest::Client,
     api_url: String,
     account_id: String,
+}
+
+/// Prints no HTTP client: its default headers carry the account credentials.
+impl std::fmt::Debug for RawJmap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawJmap")
+            .field("api_url", &self.api_url)
+            .field("account_id", &self.account_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reject a declared `Content-Length` above [`MAX_RESPONSE_BYTES`].
+fn check_content_length(method: &str, length: Option<u64>) -> Result<(), AppError> {
+    match length {
+        Some(n) if n > MAX_RESPONSE_BYTES as u64 => Err(too_large(method)),
+        _ => Ok(()),
+    }
+}
+
+/// Append `chunk` to `body` unless that takes it past [`MAX_RESPONSE_BYTES`].
+fn push_capped(method: &str, body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), AppError> {
+    if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+        return Err(too_large(method));
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+fn too_large(method: &str) -> AppError {
+    AppError::JmapRequest(format!(
+        "{method} response exceeds {MAX_RESPONSE_BYTES} bytes"
+    ))
+}
+
+/// Read a response body in chunks, failing once it exceeds [`MAX_RESPONSE_BYTES`].
+pub(crate) async fn read_body_capped(
+    method: &str,
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, AppError> {
+    check_content_length(method, response.content_length())?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| AppError::JmapRequest(format!("{method} response body failed: {e}")))?
+    {
+        push_capped(method, &mut body, &chunk)?;
+    }
+    Ok(body)
 }
 
 impl RawJmap {
@@ -52,14 +105,15 @@ impl RawJmap {
             .await
             .map_err(|e| AppError::JmapRequest(format!("{method} request failed: {e}")))?;
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| AppError::JmapRequest(format!("{method} response body failed: {e}")))?;
+        let body = read_body_capped(method, response).await?;
         if !status.is_success() {
-            return Err(http_error(method, status.as_u16(), &body));
+            return Err(http_error(
+                method,
+                status.as_u16(),
+                &String::from_utf8_lossy(&body),
+            ));
         }
-        let body: Value = serde_json::from_str(&body)
+        let body: Value = serde_json::from_slice(&body)
             .map_err(|e| AppError::JmapRequest(format!("{method} returned invalid JSON: {e}")))?;
         parse_response(method, body)
     }
@@ -295,6 +349,40 @@ mod tests {
             http_error("Quota/get", 502, "bad gateway"),
             AppError::JmapRequest(_)
         ));
+    }
+
+    #[test]
+    fn oversized_responses_are_opaque_errors() {
+        assert!(check_content_length("M/get", None).is_ok());
+        assert!(check_content_length("M/get", Some(MAX_RESPONSE_BYTES as u64)).is_ok());
+        assert!(matches!(
+            check_content_length("M/get", Some(MAX_RESPONSE_BYTES as u64 + 1)),
+            Err(AppError::JmapRequest(_))
+        ));
+
+        let mut body = vec![0u8; MAX_RESPONSE_BYTES - 1];
+        assert!(push_capped("M/get", &mut body, b"x").is_ok());
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+        assert!(matches!(
+            push_capped("M/get", &mut body, b"y"),
+            Err(AppError::JmapRequest(_))
+        ));
+        assert_eq!(body.len(), MAX_RESPONSE_BYTES);
+    }
+
+    #[test]
+    fn debug_does_not_print_credentials() {
+        let headers = crate::jmap::api_headers(&reqwest::header::HeaderMap::from_iter([(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_static("Basic c2VjcmV0LWNyZWRlbnRpYWw="),
+        )]));
+        assert!(headers[reqwest::header::AUTHORIZATION].is_sensitive());
+        let http = crate::jmap::api_http_client(headers).expect("client");
+        let raw = RawJmap::new(http, "https://mail.example.com/jmap".into(), "a1".into());
+        let debug = format!("{raw:?}");
+        assert!(!debug.contains("c2VjcmV0"), "{debug}");
+        assert!(!debug.to_lowercase().contains("authorization"), "{debug}");
+        assert!(debug.contains("a1"), "{debug}");
     }
 
     #[test]

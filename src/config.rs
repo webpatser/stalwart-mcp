@@ -70,8 +70,10 @@ pub struct Capabilities {
     /// Stalwart 1.1+). Listing them is always allowed. Default: false.
     #[serde(default)]
     pub masked_email: bool,
-    /// Allow changing the vacation response, which makes the server send
-    /// auto-replies when enabled. Reading it is always allowed. Default: false.
+    /// Allow changing the vacation response. An enabled response makes the
+    /// server auto-reply to every sender, also after the session ends, until
+    /// its `to_date` (required, at most 90 days ahead). Reading it is always
+    /// allowed. Default: false.
     #[serde(default)]
     pub vacation: bool,
 }

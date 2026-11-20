@@ -50,7 +50,7 @@ pub struct VacationSetArgs {
     pub is_enabled: bool,
     /// Start of the vacation as an RFC 3339 timestamp. Omit for no start date.
     pub from_date: Option<String>,
-    /// End of the vacation as an RFC 3339 timestamp. Omit for no end date.
+    /// End of the vacation as an RFC 3339 timestamp. Required when enabling: in the future and at most 90 days ahead.
     pub to_date: Option<String>,
     /// Subject of the auto-reply. Omit to let the server choose one.
     pub subject: Option<String>,
@@ -60,16 +60,47 @@ pub struct VacationSetArgs {
     pub html_body: Option<String>,
 }
 
-/// Normalise an RFC 3339 timestamp to the JMAP UTCDate form.
-fn utc_date(field: &str, value: Option<&str>) -> Result<Option<String>, ErrorData> {
+/// Longest time ahead an enabled vacation response may end.
+const MAX_VACATION_DAYS: i64 = 90;
+
+/// A maximum input length, in characters or in bytes.
+#[derive(Debug, Clone, Copy)]
+enum Limit {
+    Chars(usize),
+    Bytes(usize),
+}
+
+const MAX_MASKED_DESCRIPTION: Limit = Limit::Chars(256);
+const MAX_MASKED_URL: Limit = Limit::Chars(2048);
+const MAX_MASKED_FOR_DOMAIN: Limit = Limit::Chars(255);
+const MAX_VACATION_SUBJECT: Limit = Limit::Chars(998);
+const MAX_VACATION_BODY: Limit = Limit::Bytes(64 * 1024);
+
+/// Reject `value` when it is longer than `limit`.
+fn check_len(field: &str, value: Option<&str>, limit: Limit) -> Result<(), ErrorData> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let (len, max, unit) = match limit {
+        Limit::Chars(max) => (value.chars().count(), max, "characters"),
+        Limit::Bytes(max) => (value.len(), max, "bytes"),
+    };
+    if len > max {
+        return Err(ErrorData::invalid_params(
+            format!("'{field}' must be at most {max} {unit}"),
+            None,
+        ));
+    }
+    Ok(())
+}
+
+type UtcDateTime = chrono::DateTime<chrono::Utc>;
+
+fn parse_utc(field: &str, value: Option<&str>) -> Result<Option<UtcDateTime>, ErrorData> {
     value
         .map(|v| {
             chrono::DateTime::parse_from_rfc3339(v)
-                .map(|d| {
-                    d.with_timezone(&chrono::Utc)
-                        .format("%Y-%m-%dT%H:%M:%SZ")
-                        .to_string()
-                })
+                .map(|d| d.with_timezone(&chrono::Utc))
                 .map_err(|_| {
                     ErrorData::invalid_params(
                         format!(
@@ -80,6 +111,56 @@ fn utc_date(field: &str, value: Option<&str>) -> Result<Option<String>, ErrorDat
                 })
         })
         .transpose()
+}
+
+fn format_utc(date: UtcDateTime) -> String {
+    date.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Normalise an RFC 3339 timestamp to the JMAP UTCDate form.
+fn utc_date(field: &str, value: Option<&str>) -> Result<Option<String>, ErrorData> {
+    Ok(parse_utc(field, value)?.map(format_utc))
+}
+
+/// Check the vacation date range. An enabled response needs a `to_date` in
+/// the future and at most [`MAX_VACATION_DAYS`] ahead of `now`, so an
+/// auto-reply can never run without an end.
+fn validate_vacation_dates(
+    is_enabled: bool,
+    from: Option<UtcDateTime>,
+    to: Option<UtcDateTime>,
+    now: UtcDateTime,
+) -> Result<(), ErrorData> {
+    if let (Some(from), Some(to)) = (from, to)
+        && from >= to
+    {
+        return Err(ErrorData::invalid_params(
+            "'from_date' must be before 'to_date'",
+            None,
+        ));
+    }
+    if !is_enabled {
+        return Ok(());
+    }
+    let Some(to) = to else {
+        return Err(ErrorData::invalid_params(
+            "'to_date' is required when 'is_enabled' is true",
+            None,
+        ));
+    };
+    if to <= now {
+        return Err(ErrorData::invalid_params(
+            "'to_date' must be in the future",
+            None,
+        ));
+    }
+    if to > now + chrono::Duration::days(MAX_VACATION_DAYS) {
+        return Err(ErrorData::invalid_params(
+            format!("'to_date' must be at most {MAX_VACATION_DAYS} days from now"),
+            None,
+        ));
+    }
+    Ok(())
 }
 
 fn validate_prefix(prefix: &str) -> Result<(), ErrorData> {
@@ -150,6 +231,17 @@ impl StalwartMcp {
                 None,
             ));
         }
+        check_len(
+            "description",
+            args.description.as_deref(),
+            MAX_MASKED_DESCRIPTION,
+        )?;
+        check_len("url", args.url.as_deref(), MAX_MASKED_URL)?;
+        check_len(
+            "for_domain",
+            args.for_domain.as_deref(),
+            MAX_MASKED_FOR_DOMAIN,
+        )?;
         if let Some(prefix) = args.email_prefix.as_deref() {
             validate_prefix(prefix)?;
         }
@@ -226,7 +318,7 @@ impl StalwartMcp {
     }
 
     #[tool(
-        description = "Replace the account's vacation response (out-of-office auto-reply). Every field is set as given: omitted fields are cleared. When enabled, the server sends auto-replies to incoming mail. Returns the stored vacation response. Requires 'vacation' capability enabled in config."
+        description = "Replace the account's vacation response (out-of-office auto-reply). Enabling it makes the mail server send an automatic reply to anyone who mails this account, and it keeps doing so after this session ends, until 'to_date'. Only enable it when the user explicitly asks for an auto-reply, and call mail_vacation_get first to see the current one. The subject and body go to every sender, so they must not contain private data. The call replaces the whole response: every field is set as given and omitted fields are cleared. When 'is_enabled' is true, 'to_date' is required and must be in the future and at most 90 days ahead; disabling needs no dates. Returns the stored vacation response. Requires 'vacation' capability enabled in config."
     )]
     pub async fn mail_vacation_set(
         &self,
@@ -241,22 +333,21 @@ impl StalwartMcp {
             ));
         }
 
+        check_len("subject", args.subject.as_deref(), MAX_VACATION_SUBJECT)?;
+        check_len("text_body", args.text_body.as_deref(), MAX_VACATION_BODY)?;
+        check_len("html_body", args.html_body.as_deref(), MAX_VACATION_BODY)?;
+        let from_date = parse_utc("from_date", args.from_date.as_deref())?;
+        let to_date = parse_utc("to_date", args.to_date.as_deref())?;
+        validate_vacation_dates(args.is_enabled, from_date, to_date, chrono::Utc::now())?;
+
         let vacation = VacationResponse {
             is_enabled: args.is_enabled,
-            from_date: utc_date("from_date", args.from_date.as_deref())?,
-            to_date: utc_date("to_date", args.to_date.as_deref())?,
+            from_date: from_date.map(format_utc),
+            to_date: to_date.map(format_utc),
             subject: args.subject,
             text_body: args.text_body,
             html_body: args.html_body,
         };
-        if let (Some(from), Some(to)) = (&vacation.from_date, &vacation.to_date)
-            && from >= to
-        {
-            return Err(ErrorData::invalid_params(
-                "'from_date' must be before 'to_date'",
-                None,
-            ));
-        }
 
         tracing::info!(event = "mail_vacation_set", account = ?args.account, is_enabled = vacation.is_enabled, "Setting vacation response");
 
@@ -320,6 +411,69 @@ mod tests {
         );
         assert_eq!(utc_date("d", None).expect("none"), None);
         assert!(utc_date("d", Some("next week")).is_err());
+    }
+
+    fn at(s: &str) -> UtcDateTime {
+        parse_utc("d", Some(s)).expect("parse").expect("some")
+    }
+
+    #[test]
+    fn enabled_vacation_needs_a_bounded_future_end() {
+        let now = at("2026-11-20T12:00:00Z");
+        let ok = |enabled, from: Option<&str>, to: Option<&str>| {
+            validate_vacation_dates(enabled, from.map(at), to.map(at), now).is_ok()
+        };
+        // Disabling needs no dates, and past dates are fine when disabled.
+        assert!(ok(false, None, None));
+        assert!(ok(false, None, Some("2020-01-01T00:00:00Z")));
+        // Enabling requires a to_date, in the future, within 90 days.
+        assert!(!ok(true, None, None));
+        assert!(!ok(true, Some("2026-11-21T00:00:00Z"), None));
+        assert!(!ok(true, None, Some("2026-11-20T11:59:59Z")));
+        assert!(!ok(true, None, Some("2026-11-20T12:00:00Z")));
+        assert!(ok(true, None, Some("2026-11-21T00:00:00Z")));
+        assert!(ok(true, None, Some("2027-02-18T12:00:00Z")));
+        assert!(!ok(true, None, Some("2027-02-18T12:00:01Z")));
+        // The range check still applies either way.
+        assert!(!ok(
+            true,
+            Some("2026-12-02T00:00:00Z"),
+            Some("2026-12-01T00:00:00Z")
+        ));
+        assert!(!ok(
+            false,
+            Some("2026-12-01T00:00:00Z"),
+            Some("2026-12-01T00:00:00Z")
+        ));
+    }
+
+    #[test]
+    fn input_lengths_are_capped() {
+        assert!(check_len("f", None, Limit::Chars(1)).is_ok());
+        assert!(
+            check_len(
+                "description",
+                Some(&"é".repeat(256)),
+                MAX_MASKED_DESCRIPTION
+            )
+            .is_ok()
+        );
+        let err = check_len(
+            "description",
+            Some(&"a".repeat(257)),
+            MAX_MASKED_DESCRIPTION,
+        )
+        .expect_err("too long");
+        assert_eq!(err.message, "'description' must be at most 256 characters");
+        assert!(check_len("url", Some(&"a".repeat(2049)), MAX_MASKED_URL).is_err());
+        assert!(check_len("for_domain", Some(&"a".repeat(256)), MAX_MASKED_FOR_DOMAIN).is_err());
+        assert!(check_len("subject", Some(&"a".repeat(998)), MAX_VACATION_SUBJECT).is_ok());
+        assert!(check_len("subject", Some(&"a".repeat(999)), MAX_VACATION_SUBJECT).is_err());
+        assert!(check_len("text_body", Some(&"a".repeat(65536)), MAX_VACATION_BODY).is_ok());
+        // Bodies count bytes: 32769 two-byte characters exceed 64 KiB.
+        let err = check_len("html_body", Some(&"é".repeat(32769)), MAX_VACATION_BODY)
+            .expect_err("too long");
+        assert_eq!(err.message, "'html_body' must be at most 65536 bytes");
     }
 
     #[test]

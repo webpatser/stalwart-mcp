@@ -602,7 +602,7 @@ impl StalwartMcp {
     }
 
     #[tool(
-        description = "Permanently delete multiple emails in a single JMAP request. This destroys the emails entirely — they cannot be recovered. Use this for bulk cleanup of unwanted but non-spam emails (e.g. DMARC reports, automated notifications)."
+        description = "Permanently delete multiple emails in a single JMAP request. This destroys the emails entirely: they cannot be recovered. Use this for bulk cleanup of unwanted but non-spam emails (e.g. DMARC reports, automated notifications)."
     )]
     pub async fn mail_bulk_delete(
         &self,

@@ -10,6 +10,13 @@ Tested against Stalwart 1.1.1.
 - `quota_get` (`Quota/get`, RFC 9425) and `identity_list` (`Identity/get`).
 - New capability flags `capabilities.masked_email` (create and disable masked addresses) and `capabilities.vacation` (change the vacation response, which makes the server send auto-replies). Both default to false; the list and get tools are always available.
 - Server refusals from the new tools (for example the per-account masked address quota, `overQuota`) are passed to the client with the server's reason instead of a generic upstream error.
+- `mail_vacation_set` refuses to enable an auto-reply without an end: `to_date` is required when `is_enabled` is true and must be in the future and at most 90 days ahead. Disabling needs no dates. The tool description now states that the server keeps replying after the session ends and that the reply must not contain private data.
+- Input limits on the new tools: masked `description` 256 characters, `url` 2048, `for_domain` 255; vacation `subject` 998 characters, `text_body` and `html_body` 64 KiB each.
+
+### Security
+- The HTTP client for the new tools and for `spam_train` no longer follows redirects, so a 307 or 308 cannot re-post a JMAP request with its credentials to another host. It is built once per account instead of on every call.
+- JMAP responses read by the new tools and `spam_train` are capped at 8 MB.
+- The Authorization header copied from jmap-client is marked sensitive, and the raw JMAP and spam-filter clients print no headers in their `Debug` output.
 
 ### Changed
 - The `mail_search` description notes that Stalwart indexes full text asynchronously, so very recent mail may not be found yet.
