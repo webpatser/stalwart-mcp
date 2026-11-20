@@ -8,6 +8,7 @@
 - `spam_train` no longer downloads raw email bodies locally; the server fetches each email's existing JMAP blob directly.
 - HTTP mode refuses to start when `server.allowed_hosts` is set without `auth.secret`, so a same-host reverse proxy cannot bypass JWT auth.
 - Updated compatible dependencies, added `rust-version`, sorted the manifest, fixed the repository URL, and CI now builds with `--locked` and runs the tests.
+- Upgraded `jsonwebtoken` to 12 (still on the `aws_lc_rs` backend); existing tokens stay valid, and `token create` now errors on an empty `auth.secret` instead of signing with an empty key.
 
 ### Compatibility
 - Requires Stalwart v0.16.x or later for `spam_train`.

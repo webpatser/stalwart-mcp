@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive"] }
 figment = { version = "0.10", features = ["toml", "env"] }
 futures = "0.3"
 jmap-client = "0.4"
-jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "12.0.0", features = ["aws_lc_rs"] }
 rand = "0.10.4"
 reqwest = { version = "0.13.5", features = ["stream", "json"] }
 rmcp = { version = "1.4", features = ["server", "transport-io", "transport-streamable-http-server", "macros"] }
