@@ -50,6 +50,9 @@ impl AccountConfig {
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
+    /// Allowed HTTP Host values. Empty retains rmcp's loopback-only defaults.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 fn default_bind() -> String {
@@ -147,6 +150,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
+            allowed_hosts: Vec::new(),
         }
     }
 }

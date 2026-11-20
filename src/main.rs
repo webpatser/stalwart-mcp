@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
                 StalwartMcp::new(manager, config.capabilities, config.notifications, admin);
 
             if let Some(addr) = bind {
-                serve_http(server, &addr, &config.auth).await?;
+                serve_http(server, &addr, &config.auth, &config.server).await?;
             } else {
                 serve_stdio(server).await?;
             }
@@ -172,14 +172,8 @@ async fn serve_http(
     server: StalwartMcp,
     addr: &str,
     auth_config: &stalwart_mcp::config::AuthConfig,
+    server_config: &stalwart_mcp::config::ServerConfig,
 ) -> anyhow::Result<()> {
-    use axum::Router;
-    use rmcp::transport::streamable_http_server::{
-        StreamableHttpService, session::local::LocalSessionManager,
-    };
-    use stalwart_mcp::auth::AuthSecret;
-    use std::sync::Arc;
-
     let is_localhost = addr.starts_with("127.0.0.1") || addr.starts_with("localhost");
 
     if !is_localhost && auth_config.secret.is_none() {
@@ -189,26 +183,19 @@ async fn serve_http(
         );
     }
 
-    if !is_localhost {
+    if auth_config
+        .secret
+        .as_ref()
+        .is_some_and(|secret| !secret.is_empty())
+    {
+        tracing::info!(addr = %addr, "Starting MCP server on HTTP (JWT required for all requests)");
+    } else if !is_localhost {
         tracing::info!(addr = %addr, "Starting MCP server on HTTP (JWT required for remote)");
     } else {
         tracing::info!(addr = %addr, "Starting MCP server on HTTP (localhost, no auth required)");
     }
 
-    let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
-        Default::default(),
-    );
-
-    let secret = auth_config.secret.clone().unwrap_or_default();
-
-    let router = Router::new()
-        .nest_service("/mcp", service)
-        .layer(axum::Extension(AuthSecret(secret)))
-        .layer(axum::middleware::from_fn(
-            stalwart_mcp::auth::auth_middleware,
-        ));
+    let router = http_router(server, auth_config, server_config);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(
@@ -221,3 +208,148 @@ async fn serve_http(
 }
 
 use std::net::SocketAddr;
+
+fn http_router(
+    server: impl rmcp::ServerHandler + Clone,
+    auth_config: &stalwart_mcp::config::AuthConfig,
+    server_config: &stalwart_mcp::config::ServerConfig,
+) -> axum::Router {
+    use axum::Router;
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
+    };
+    use stalwart_mcp::auth::AuthSecret;
+    use std::sync::Arc;
+
+    let mut transport_config =
+        rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
+    if !server_config.allowed_hosts.is_empty() {
+        transport_config = transport_config.with_allowed_hosts(server_config.allowed_hosts.clone());
+    }
+
+    let service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        transport_config,
+    );
+
+    let secret = auth_config.secret.clone().unwrap_or_default();
+
+    Router::new()
+        .nest_service("/mcp", service)
+        .layer(axum::middleware::from_fn(
+            stalwart_mcp::auth::auth_middleware,
+        ))
+        .layer(axum::Extension(AuthSecret(secret)))
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        extract::ConnectInfo,
+        http::{Request, StatusCode},
+    };
+    use stalwart_mcp::config::{AuthConfig, ServerConfig};
+    use tower::ServiceExt;
+
+    #[derive(Clone)]
+    struct TestServer;
+    impl rmcp::ServerHandler for TestServer {}
+
+    async fn request(
+        local: bool,
+        secret: &str,
+        token: Option<&str>,
+        host: &str,
+        hosts: Vec<String>,
+    ) -> StatusCode {
+        let router = http_router(
+            TestServer,
+            &AuthConfig {
+                secret: Some(secret.into()),
+            },
+            &ServerConfig {
+                allowed_hosts: hosts,
+                ..Default::default()
+            },
+        );
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("host", host)
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let mut request = request.body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"regression-test","version":"1"}}}"#)).unwrap();
+        let addr = if local {
+            "127.0.0.1:1234"
+        } else {
+            "192.0.2.1:1234"
+        };
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(addr.parse::<SocketAddr>().unwrap()));
+        router.oneshot(request).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn authentication_matrix_and_layer_order() {
+        let secret = "test-secret-used-only-in-tests";
+        let valid = stalwart_mcp::auth::create_token(secret, "*", &["*".into()], 1).unwrap();
+        let wrong = stalwart_mcp::auth::create_token("wrong-secret", "*", &[], 1).unwrap();
+        assert_eq!(
+            request(true, "", None, "localhost", vec![]).await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(false, "", None, "localhost", vec![]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        for local in [true, false] {
+            for token in [None, Some("invalid"), Some(wrong.as_str())] {
+                assert_eq!(
+                    request(local, secret, token, "localhost", vec![]).await,
+                    StatusCode::UNAUTHORIZED
+                );
+            }
+            assert_eq!(
+                request(local, secret, Some(&valid), "localhost", vec![]).await,
+                StatusCode::OK
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn allowed_hosts_keep_defaults_and_support_proxy_hostname() {
+        assert_eq!(
+            request(true, "", None, "untrusted.example", vec![]).await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            request(
+                true,
+                "",
+                None,
+                "mcp.example.com",
+                vec!["mcp.example.com".into()]
+            )
+            .await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(
+                true,
+                "",
+                None,
+                "untrusted.example",
+                vec!["mcp.example.com".into()]
+            )
+            .await,
+            StatusCode::FORBIDDEN
+        );
+    }
+}
