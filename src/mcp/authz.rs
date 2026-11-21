@@ -49,6 +49,9 @@ pub const TOOL_SCOPES: &[(&str, Scope)] = &[
     ("mail_vacation_get", Scope::Read),
     ("quota_get", Scope::Read),
     ("identity_list", Scope::Read),
+    ("sieve_list", Scope::Read),
+    ("sieve_get", Scope::Read),
+    ("sieve_validate", Scope::Read),
     ("mail_flag", Scope::Modify),
     ("mail_move", Scope::Modify),
     ("mail_draft", Scope::Modify),
@@ -60,6 +63,8 @@ pub const TOOL_SCOPES: &[(&str, Scope)] = &[
     ("spam_train", Scope::Modify),
     ("mail_send", Scope::Send),
     ("mail_vacation_set", Scope::Send),
+    // A Sieve script can redirect mail to any address.
+    ("sieve_put", Scope::Send),
 ];
 
 /// Look up the scope a tool requires. `None` means the tool is unknown.
@@ -325,7 +330,9 @@ mod tests {
 
     #[test]
     fn every_router_tool_has_a_scope_and_an_account_property() {
-        let router = StalwartMcp::create_tool_router() + StalwartMcp::create_account_tool_router();
+        let router = StalwartMcp::create_tool_router()
+            + StalwartMcp::create_account_tool_router()
+            + StalwartMcp::create_sieve_tool_router();
         let tools = router.list_all();
         assert!(!tools.is_empty());
         for tool in &tools {

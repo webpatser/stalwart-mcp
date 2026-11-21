@@ -24,6 +24,10 @@ bind = "127.0.0.1:3000"
 # Allow mail_bulk_delete with permanent = true, which destroys emails beyond
 # recovery (default: false). Moving them to Trash is always allowed.
 # delete = true
+# Allow sieve_put to create or replace Sieve filter scripts (default: false). A
+# wrong script can discard or redirect incoming mail. Listing, reading and
+# validating scripts is always allowed.
+# sieve = true
 
 [notifications]
 # Enable JMAP EventSource for real-time notifications (default: true)

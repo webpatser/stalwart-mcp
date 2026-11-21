@@ -2,6 +2,7 @@ pub mod account;
 pub mod mail;
 pub mod masked_email;
 pub mod raw;
+pub mod sieve;
 pub mod spam_filter;
 
 use crate::config::AccountConfig;

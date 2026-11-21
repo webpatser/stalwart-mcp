@@ -9,7 +9,10 @@
 //! - vacation response: written only with `isEnabled: false`, then restored to
 //!   the exact prior state. Skipped when an auto-reply is active, so a real
 //!   out-of-office is never interrupted. A Sieve script the update had to
-//!   create is destroyed again.
+//!   create is destroyed again;
+//! - sieve: one inactive script with a unique name is created, read back and
+//!   destroyed. Nothing is ever activated, and the script list and the active
+//!   script are asserted equal to before.
 //!
 //! Output holds counts and redacted response shapes only, no addresses.
 //!
@@ -21,6 +24,7 @@ use stalwart_mcp::error::AppError;
 use stalwart_mcp::jmap::JmapClient;
 use stalwart_mcp::jmap::account::VacationResponse;
 use stalwart_mcp::jmap::masked_email::NewMaskedEmail;
+use stalwart_mcp::jmap::sieve::SievePut;
 
 fn test_config() -> Option<AccountConfig> {
     let url = std::env::var("STALWART_TEST_URL").ok()?;
@@ -394,6 +398,165 @@ async fn test_vacation_roundtrip_restores_state() {
 
     assert_eq!(stored, test_state, "VacationResponse/get after set differs");
     eprintln!("test state had been written and read back equal (isEnabled false)");
+}
+
+/// The account's scripts as comparable `(id, name, blobId, isActive)` tuples.
+async fn sieve_state(client: &JmapClient) -> Vec<(String, Option<String>, String, bool)> {
+    let mut state: Vec<_> = ok("SieveScript/get", client.list_sieve_scripts().await)
+        .into_iter()
+        .map(|s| (s.id, s.name, s.blob_id, s.is_active))
+        .collect();
+    state.sort();
+    state
+}
+
+const TEST_SIEVE_SCRIPT: &str = "# stalwart-mcp integration test, never activated\nkeep;\n";
+const BROKEN_SIEVE_SCRIPT: &str = "if header :contains \"subject\" { keep;\n";
+
+/// Creates one inactive script with a unique name, reads it back, checks that
+/// the server rejects a broken script, destroys the test script and asserts
+/// the script list and the active script are exactly as before. Never
+/// activates anything and never touches a script it did not create.
+#[tokio::test]
+#[ignore = "requires running Stalwart instance"]
+async fn test_sieve_script_lifecycle() {
+    let Some(client) = connect().await else {
+        return;
+    };
+    let before = sieve_state(&client).await;
+    let active_before: Vec<_> = before.iter().filter(|s| s.3).map(|s| s.0.clone()).collect();
+    eprintln!(
+        "sieve scripts before: {} ({} active)",
+        before.len(),
+        active_before.len()
+    );
+
+    let name = format!("stalwart-mcp-test-{}", nanos());
+    let created = ok(
+        "sieve put (create)",
+        client
+            .put_sieve_script(&SievePut {
+                id: None,
+                name: Some(&name),
+                content: TEST_SIEVE_SCRIPT,
+                activate: false,
+            })
+            .await,
+    );
+    let id = created.id.clone();
+    eprintln!("created sieve script {id}, active {}", created.is_active);
+
+    let outcome = sieve_steps(&client, &id, &name).await;
+    let cleaned = sieve_cleanup(&client, &id, &name).await;
+    if let Err(msg) = outcome {
+        panic!("{msg} (cleanup: {cleaned:?})");
+    }
+    if let Err(msg) = cleaned {
+        panic!("{msg}");
+    }
+
+    let after = sieve_state(&client).await;
+    let active_after: Vec<_> = after.iter().filter(|s| s.3).map(|s| s.0.clone()).collect();
+    assert_eq!(after, before, "sieve scripts differ from before the test");
+    assert_eq!(
+        active_after, active_before,
+        "the active sieve script changed"
+    );
+    eprintln!(
+        "sieve scripts restored: {} ({} active), equal to before",
+        after.len(),
+        active_after.len()
+    );
+}
+
+async fn sieve_steps(client: &JmapClient, id: &str, name: &str) -> Result<(), String> {
+    let read = client
+        .get_sieve_script(id)
+        .await
+        .map_err(|e| format!("sieve get failed: {e}"))?;
+    if read.script.name.as_deref() != Some(name) {
+        return Err(format!("{id} carries another name"));
+    }
+    if read.script.is_active {
+        return Err(format!("{id} was created ACTIVE"));
+    }
+    if read.content != TEST_SIEVE_SCRIPT {
+        return Err(format!("{id} content differs after read back"));
+    }
+    eprintln!("read back {id}: name and content equal, inactive");
+
+    let valid = client
+        .validate_sieve_script(TEST_SIEVE_SCRIPT)
+        .await
+        .map_err(|e| format!("SieveScript/validate (valid) failed: {e}"))?;
+    if !valid.valid {
+        return Err(format!("valid script reported invalid: {:?}", valid.error));
+    }
+    let broken = client
+        .validate_sieve_script(BROKEN_SIEVE_SCRIPT)
+        .await
+        .map_err(|e| format!("SieveScript/validate (broken) failed: {e}"))?;
+    eprintln!("broken script validation: {broken:?}");
+    if broken.valid || broken.error.is_none() {
+        return Err("the server accepted a broken script".into());
+    }
+
+    let refused = client
+        .put_sieve_script(&SievePut {
+            id: Some(id),
+            name: None,
+            content: BROKEN_SIEVE_SCRIPT,
+            activate: false,
+        })
+        .await;
+    match refused {
+        Err(AppError::Rejected(e)) => eprintln!("put of a broken script refused: {e}"),
+        other => return Err(format!("put of a broken script was not refused: {other:?}")),
+    }
+    let unchanged = client
+        .get_sieve_script(id)
+        .await
+        .map_err(|e| format!("sieve get after refused put failed: {e}"))?;
+    if unchanged.content != TEST_SIEVE_SCRIPT || unchanged.script.is_active {
+        return Err(format!("{id} changed after a refused put"));
+    }
+    Ok(())
+}
+
+/// Destroy the test script, only if `id` still carries our name and is
+/// inactive. Anything else is left alone and reported.
+async fn sieve_cleanup(client: &JmapClient, id: &str, name: &str) -> Result<(), String> {
+    match client.get_sieve_script_meta(id).await {
+        Ok(s) if s.name.as_deref() == Some(name) && !s.is_active => {}
+        Ok(s) => {
+            return Err(format!(
+                "cleanup: {id} is not our inactive script (active {}), not touching it",
+                s.is_active
+            ));
+        }
+        Err(AppError::NotFound(_)) => {
+            eprintln!("cleanup: {id} is already gone");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("cleanup: SieveScript/get failed: {e}")),
+    }
+    if let Err(e) = client.destroy_sieve_script(id).await {
+        eprintln!(
+            "!!!!! cleanup: SieveScript/set destroy of {id} FAILED ({e}); \
+             the inactive test script is LEFT BEHIND !!!!!"
+        );
+        return Err(format!("cleanup: destroy of {id} failed: {e}"));
+    }
+    match client.get_sieve_script_meta(id).await {
+        Err(AppError::NotFound(_)) => {
+            eprintln!("cleanup: destroyed {id}");
+            Ok(())
+        }
+        Ok(_) => Err(format!("cleanup: destroy reported success but {id} exists")),
+        Err(e) => Err(format!(
+            "cleanup: SieveScript/get after destroy failed: {e}"
+        )),
+    }
 }
 
 #[tokio::test]

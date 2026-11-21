@@ -81,6 +81,11 @@ pub struct Capabilities {
     /// Default: false.
     #[serde(default)]
     pub delete: bool,
+    /// Allow `sieve_put` to create or replace Sieve filter scripts. A wrong
+    /// script can discard or redirect incoming mail. Listing, reading and
+    /// validating scripts is always allowed. Default: false.
+    #[serde(default)]
+    pub sieve: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -224,11 +229,13 @@ mod tests {
                 && !caps.masked_email
                 && !caps.vacation
                 && !caps.delete
+                && !caps.sieve
         );
-        let caps: Capabilities =
-            serde_json::from_str(r#"{"masked_email": true, "vacation": true, "delete": true}"#)
-                .expect("caps");
-        assert!(caps.masked_email && caps.vacation && caps.delete);
+        let caps: Capabilities = serde_json::from_str(
+            r#"{"masked_email": true, "vacation": true, "delete": true, "sieve": true}"#,
+        )
+        .expect("caps");
+        assert!(caps.masked_email && caps.vacation && caps.delete && caps.sieve);
     }
 
     #[test]

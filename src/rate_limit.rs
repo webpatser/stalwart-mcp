@@ -68,6 +68,10 @@ impl RateLimiters {
         limiters.insert("mail_vacation_set", TokenBucket::new(5));
         limiters.insert("quota_get", TokenBucket::new(30));
         limiters.insert("identity_list", TokenBucket::new(30));
+        limiters.insert("sieve_list", TokenBucket::new(30));
+        limiters.insert("sieve_get", TokenBucket::new(30));
+        limiters.insert("sieve_validate", TokenBucket::new(10));
+        limiters.insert("sieve_put", TokenBucket::new(5));
 
         Self {
             limiters: Mutex::new(limiters),

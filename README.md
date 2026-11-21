@@ -39,6 +39,10 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail_vacation_set` | Replace the whole vacation response; omitted fields are cleared. Enabling it makes the server auto-reply to anyone who mails the account, also after the MCP session ends, until `to_date`, so `to_date` is required when enabling (in the future, at most 90 days ahead) and the subject and body must not contain private data. Clients should call `mail_vacation_get` first and enable only on the user's explicit request. Subject at most 998 characters, each body at most 64 KiB (requires `capabilities.vacation = true`) |
 | `quota_get` | Storage quota usage and limits (`Quota/get`, RFC 9425) |
 | `identity_list` | Sending identities: From addresses, reply-to, bcc, signatures |
+| `sieve_list` | Sieve filter scripts: ID, name and which one is active (`SieveScript/get`, RFC 9661) |
+| `sieve_get` | One Sieve script with its source, downloaded from its blob |
+| `sieve_validate` | Compile a Sieve script on the server without storing it; returns `valid` and the server's error. At most 64 KiB |
+| `sieve_put` | Create a Sieve script or replace the source of one by `id`. A wrong script can discard or redirect incoming mail. The script is always validated first and refused if it does not compile; it is stored inactive unless `activate: true`. The name `vacation` is reserved for the vacation response. At most 64 KiB (requires `capabilities.sieve = true`) |
 
 Every tool takes an optional `account` argument; omit it for the default account.
 
@@ -133,6 +137,10 @@ password_env = "STALWART_PASSWORD_WORK"
 # Allow mail_bulk_delete with permanent = true, which destroys emails beyond
 # recovery (default: false). Moving them to Trash, the default, is always allowed.
 # delete = true
+# Allow sieve_put to create or replace Sieve filter scripts (default: false). A
+# wrong script can discard or redirect incoming mail. Listing, reading and
+# validating scripts is always allowed.
+# sieve = true
 
 [notifications]
 # Real-time email notifications via JMAP EventSource (default: true)
@@ -232,9 +240,9 @@ Scopes and `--account` are enforced on every tool call and resource read. A toke
 
 | Scope | Tools |
 |-------|-------|
-| `mail:read` | `mail_list_folders`, `mail_list_recent`, `mail_search`, `mail_get`, `mail_masked_list`, `mail_vacation_get`, `quota_get`, `identity_list` |
+| `mail:read` | `mail_list_folders`, `mail_list_recent`, `mail_search`, `mail_get`, `mail_masked_list`, `mail_vacation_get`, `quota_get`, `identity_list`, `sieve_list`, `sieve_get`, `sieve_validate` |
 | `mail:modify` | `mail_flag`, `mail_move`, `mail_draft`, `mail_bulk_read`, `mail_bulk_junk`, `mail_bulk_delete`, `mail_masked_create`, `mail_masked_disable`, `spam_train` |
-| `mail:send` | `mail_send`, `mail_vacation_set` (an enabled vacation response makes the server send auto-replies) |
+| `mail:send` | `mail_send`, `mail_vacation_set` (an enabled vacation response makes the server send auto-replies), `sieve_put` (a script can redirect mail) |
 
 Capability flags in the config still apply on top of scopes. Over stdio and for loopback HTTP requests without `auth.secret` there is no token, so everything is allowed.
 

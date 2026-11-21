@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.1-4] - Unreleased
+
+### Added
+- Sieve filter tools (JMAP `SieveScript`, RFC 9661): `sieve_list`, `sieve_get` (source downloaded from the script's blob) and `sieve_validate` (server-side compile, nothing stored), scope `mail:read`.
+- `sieve_put` creates a script or replaces one by `id`, scope `mail:send` because a script can redirect mail. Behind the new `capabilities.sieve` (default false), checked before any request reaches the mail server, as is the 64 KiB script size cap. The script is always validated first, is stored inactive unless `activate: true`, and the reserved name `vacation` is refused.
+- Blob upload and download for the raw JMAP client; the session URLs must stay on the API URL's origin and redirects are not followed.
+
 ## [1.1.1-3] - 2026-11-21
 
 ### Security

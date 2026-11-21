@@ -118,6 +118,85 @@ impl RawJmap {
         parse_response(method, body)
     }
 
+    /// Upload `body` to the session's `uploadUrl` template (RFC 8620 section
+    /// 6.1). The URL must sit on the API URL's origin; redirects are never
+    /// followed, because the client is built with `Policy::none()`.
+    pub async fn upload(
+        &self,
+        upload_template: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> Result<UploadedBlob, AppError> {
+        const WHAT: &str = "Blob upload";
+        let url = expand_template(upload_template, &[("accountId", &self.account_id)]);
+        let url = same_origin_url(&self.api_url, &url, WHAT)?;
+        let response = self
+            .http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(body)
+            .send()
+            .await
+            .map_err(|e| AppError::JmapRequest(format!("{WHAT} failed: {e}")))?;
+        let status = response.status();
+        let body = read_body_capped(WHAT, response).await?;
+        if !status.is_success() {
+            return Err(http_error(
+                WHAT,
+                status.as_u16(),
+                &String::from_utf8_lossy(&body),
+            ));
+        }
+        let uploaded: UploadedBlob = serde_json::from_slice(&body)
+            .map_err(|e| AppError::JmapRequest(format!("{WHAT} returned invalid JSON: {e}")))?;
+        if uploaded.blob_id.is_empty() {
+            return Err(AppError::JmapRequest(format!("{WHAT} returned no blobId")));
+        }
+        Ok(uploaded)
+    }
+
+    /// Download a blob through the session's `downloadUrl` template, read up
+    /// to [`MAX_RESPONSE_BYTES`]. Same origin rule and no redirects, as
+    /// [`Self::upload`].
+    pub async fn download(
+        &self,
+        download_template: &str,
+        blob_id: &str,
+        content_type: &str,
+        name: &str,
+    ) -> Result<Vec<u8>, AppError> {
+        const WHAT: &str = "Blob download";
+        let url = expand_template(
+            download_template,
+            &[
+                ("accountId", &self.account_id),
+                ("blobId", blob_id),
+                ("type", content_type),
+                ("name", name),
+            ],
+        );
+        let url = same_origin_url(&self.api_url, &url, WHAT)?;
+        let response = self
+            .http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AppError::JmapRequest(format!("{WHAT} failed: {e}")))?;
+        let status = response.status();
+        let body = read_body_capped(WHAT, response).await?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::NotFound(format!("Blob {blob_id} not found")));
+        }
+        if !status.is_success() {
+            return Err(http_error(
+                WHAT,
+                status.as_u16(),
+                &String::from_utf8_lossy(&body),
+            ));
+        }
+        Ok(body)
+    }
+
     /// [`Self::call`] and deserialize the response arguments into `T`.
     pub async fn call_as<T: DeserializeOwned>(
         &self,
@@ -128,6 +207,55 @@ impl RawJmap {
         let value = self.call(capabilities, method, args).await?;
         parse_args(method, value)
     }
+}
+
+/// The upload endpoint's answer (RFC 8620 section 6.1).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UploadedBlob {
+    pub blob_id: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+/// Percent-encode everything except RFC 3986 unreserved characters.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Fill the `{variable}`s of a session URL template (RFC 6570 level 1),
+/// percent-encoding each value.
+pub fn expand_template(template: &str, vars: &[(&str, &str)]) -> String {
+    let mut url = template.to_string();
+    for (name, value) in vars {
+        url = url.replace(&format!("{{{name}}}"), &percent_encode(value));
+    }
+    url
+}
+
+/// Resolve `candidate` against the API URL and require the same scheme, host
+/// and port, so credentials never go to another origin.
+pub fn same_origin_url(api_url: &str, candidate: &str, what: &str) -> Result<url::Url, AppError> {
+    let base = url::Url::parse(api_url)
+        .map_err(|e| AppError::JmapRequest(format!("{what}: invalid API URL: {e}")))?;
+    let target = base
+        .join(candidate)
+        .map_err(|e| AppError::JmapRequest(format!("{what}: invalid session URL: {e}")))?;
+    let web = matches!(target.scheme(), "http" | "https");
+    if !web || target.origin() != base.origin() {
+        return Err(AppError::JmapRequest(format!(
+            "{what}: session URL is not on the JMAP API origin"
+        )));
+    }
+    Ok(target)
 }
 
 /// Build a single-call JMAP request. `urn:ietf:params:jmap:core` is always used.
@@ -383,6 +511,62 @@ mod tests {
         assert!(!debug.contains("c2VjcmV0"), "{debug}");
         assert!(!debug.to_lowercase().contains("authorization"), "{debug}");
         assert!(debug.contains("a1"), "{debug}");
+    }
+
+    #[test]
+    fn templates_are_expanded_and_encoded() {
+        let url = expand_template(
+            "https://mail.example.com/jmap/download/{accountId}/{blobId}/{name}?accept={type}",
+            &[
+                ("accountId", "a1"),
+                ("blobId", "b/2"),
+                ("name", "my script"),
+                ("type", "application/sieve"),
+            ],
+        );
+        assert_eq!(
+            url,
+            "https://mail.example.com/jmap/download/a1/b%2F2/my%20script?accept=application%2Fsieve"
+        );
+    }
+
+    #[test]
+    fn session_urls_must_stay_on_the_api_origin() {
+        let api = "https://mail.example.com/jmap/";
+        assert!(same_origin_url(api, "https://mail.example.com/jmap/upload/a1/", "u").is_ok());
+        assert!(same_origin_url(api, "https://mail.example.com:443/x", "u").is_ok());
+        assert_eq!(
+            same_origin_url(api, "/jmap/upload/a1/", "u")
+                .expect("relative")
+                .as_str(),
+            "https://mail.example.com/jmap/upload/a1/"
+        );
+        for bad in [
+            "http://mail.example.com/jmap/upload/a1/",
+            "https://mail.example.com:8443/jmap/upload/a1/",
+            "https://evil.example.com/jmap/upload/a1/",
+            "https://mail.example.com.evil.test/",
+            "//evil.example.com/x",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                matches!(
+                    same_origin_url(api, bad, "u"),
+                    Err(AppError::JmapRequest(_))
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn upload_response_parses() {
+        let blob: UploadedBlob = serde_json::from_value(json!({
+            "accountId": "a1", "blobId": "b1", "type": "application/sieve", "size": 42
+        }))
+        .expect("upload");
+        assert_eq!(blob.blob_id, "b1");
+        assert_eq!(blob.size, 42);
     }
 
     #[test]
