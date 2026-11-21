@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 /// Largest script accepted by `sieve_validate` and `sieve_put`, in bytes.
 /// Checked before any network call.
 pub const MAX_SCRIPT_BYTES: usize = 64 * 1024;
-/// Longest script name accepted, in characters. The server may allow less.
-pub const MAX_SCRIPT_NAME_CHARS: usize = 255;
+/// Longest script name accepted, in bytes (Stalwart 1.1.1 allows more).
+pub const MAX_SCRIPT_NAME_BYTES: usize = 128;
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SieveGetArgs {
@@ -60,7 +60,8 @@ fn check_script(script: &str) -> Result<(), ErrorData> {
 }
 
 /// A create needs a name; any given name must be non-empty, within
-/// [`MAX_SCRIPT_NAME_CHARS`] and not the server-managed `vacation`.
+/// [`MAX_SCRIPT_NAME_BYTES`], not made only of dots (`.`, `..`), free of `/`
+/// and control characters, and not the server-managed `vacation`.
 fn check_name(name: Option<&str>, creating: bool) -> Result<(), ErrorData> {
     let Some(name) = name else {
         return if creating {
@@ -75,9 +76,21 @@ fn check_name(name: Option<&str>, creating: bool) -> Result<(), ErrorData> {
     if name.trim().is_empty() {
         return Err(ErrorData::invalid_params("'name' must not be empty", None));
     }
-    if name.chars().count() > MAX_SCRIPT_NAME_CHARS {
+    if name.len() > MAX_SCRIPT_NAME_BYTES {
         return Err(ErrorData::invalid_params(
-            format!("'name' must be at most {MAX_SCRIPT_NAME_CHARS} characters"),
+            format!("'name' must be at most {MAX_SCRIPT_NAME_BYTES} bytes"),
+            None,
+        ));
+    }
+    if name.bytes().all(|b| b == b'.') {
+        return Err(ErrorData::invalid_params(
+            "'name' must not be '.' or '..'",
+            None,
+        ));
+    }
+    if name.chars().any(|c| c == '/' || c.is_control()) {
+        return Err(ErrorData::invalid_params(
+            "'name' must not contain '/' or control characters",
             None,
         ));
     }
@@ -177,7 +190,7 @@ impl StalwartMcp {
     }
 
     #[tool(
-        description = "Create a Sieve filter script, or replace the source of an existing one by 'id'. A wrong script can silently discard, reject or redirect incoming mail, so only do this when the user explicitly asks, show them the script first, and call sieve_list to see the active script. The script is always validated by the server first and refused if it does not compile. It is stored inactive unless 'activate' is true; activating it replaces the currently active script. Replacing the source of the active script changes live filtering immediately. Returns the stored script. Requires 'sieve' capability enabled in config."
+        description = "Create a Sieve filter script, or replace the source of an existing one by 'id'. A wrong script can silently discard, reject or redirect incoming mail, so only do this when the user explicitly asks, show them the script first, and call sieve_list to see the active script. The script is always validated by the server first and refused if it does not compile. It is stored inactive unless 'activate' is true; activating it replaces the currently active script. Replacing by 'id' is refused for an unknown id and for the server-managed 'vacation' script (use mail_vacation_set); replacing the currently active script changes live filtering immediately and is refused unless 'activate' is true. Returns the stored script. Requires 'sieve' capability enabled in config."
     )]
     pub async fn sieve_put(
         &self,
@@ -226,8 +239,36 @@ mod tests {
         assert!(check_name(Some("  "), false).is_err());
         assert!(check_name(Some("Vacation"), true).is_err());
         assert!(check_name(Some("vacation"), false).is_err());
-        assert!(check_name(Some(&"a".repeat(MAX_SCRIPT_NAME_CHARS)), true).is_ok());
-        assert!(check_name(Some(&"a".repeat(MAX_SCRIPT_NAME_CHARS + 1)), true).is_err());
+        assert!(check_name(Some(&"a".repeat(MAX_SCRIPT_NAME_BYTES)), true).is_ok());
+        assert!(check_name(Some(&"a".repeat(MAX_SCRIPT_NAME_BYTES + 1)), true).is_err());
+    }
+
+    #[test]
+    fn name_length_is_counted_in_bytes() {
+        let err = check_name(Some(&"é".repeat(MAX_SCRIPT_NAME_BYTES / 2 + 1)), true)
+            .expect_err("too long");
+        assert_eq!(err.message, "'name' must be at most 128 bytes");
+        assert!(check_name(Some(&"é".repeat(MAX_SCRIPT_NAME_BYTES / 2)), true).is_ok());
+    }
+
+    #[test]
+    fn dot_names_are_refused() {
+        for bad in [".", "..", "..."] {
+            assert!(check_name(Some(bad), true).is_err(), "{bad}");
+        }
+        assert!(check_name(Some(".filters"), true).is_ok());
+        assert!(check_name(Some("a..b"), true).is_ok());
+    }
+
+    #[test]
+    fn slash_and_control_characters_are_refused() {
+        for bad in ["a/b", "/", "../x", "a\nb", "a\tb", "a\u{0}b", "a\u{7f}b"] {
+            let err = check_name(Some(bad), true).expect_err(bad);
+            assert!(
+                err.message.contains("'/'") || err.message.contains("'.'"),
+                "{bad}: {err:?}"
+            );
+        }
     }
 
     #[test]

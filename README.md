@@ -42,8 +42,8 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `identity_list` | Sending identities: From addresses, reply-to, bcc, signatures |
 | `sieve_list` | Sieve filter scripts: ID, name and which one is active (`SieveScript/get`, RFC 9661) |
 | `sieve_get` | One Sieve script with its source, downloaded from its blob |
-| `sieve_validate` | Compile a Sieve script on the server without storing it; returns `valid` and the server's error. At most 64 KiB |
-| `sieve_put` | Create a Sieve script or replace the source of one by `id`. A wrong script can discard or redirect incoming mail. The script is always validated first and refused if it does not compile; it is stored inactive unless `activate: true`. The name `vacation` is reserved for the vacation response. At most 64 KiB (requires `capabilities.sieve = true`) |
+| `sieve_validate` | Compile a Sieve script on the server without storing it as a script; returns `valid` and the server's error. At most 64 KiB. The script is uploaded as a temporary blob that the server expires, which is why the tool is rate-limited although it needs only `mail:read` |
+| `sieve_put` | Create a Sieve script or replace the source of one by `id`. A wrong script can discard or redirect incoming mail. The script is always validated first and refused if it does not compile; it is stored inactive unless `activate: true`. The name `vacation` is reserved for the vacation response, and the server-managed `vacation` script cannot be replaced by `id`. Replacing the active script changes live filtering and is refused unless `activate: true`; an unknown `id` is refused before anything is uploaded. Names are at most 128 bytes, not `.` or `..`, without `/` or control characters. At most 64 KiB (requires `capabilities.sieve = true`) |
 | `contacts_search` | Search contacts by text (`ContactCard/query`, RFC 9610; the server matches whole words in name, email, organisation and other card fields), or list them when `query` is omitted. Returns only name, email addresses, organisations and address book names; nothing else is requested from the server. Default 20, at most 50 results. Needs `urn:ietf:params:jmap:contacts` in the session |
 
 `contacts_search` was verified live against Stalwart 1.1.1: a live test creates one made-up card, finds it by text search, checks that name, email address, organisation and address book are extracted, then destroys it and asserts the card count is unchanged.
@@ -91,6 +91,7 @@ To pick a build for your server, take the newest tag whose first three numbers a
 | `1.1.1-1`    | 1.1.1    |
 | `1.1.1-2`    | 1.1.1    |
 | `1.1.1-3`    | 1.1.1    |
+| `1.1.1-4`    | 1.1.1    |
 
 Test coverage for `1.0.3-1`: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3.
 
@@ -98,7 +99,7 @@ Test coverage for `1.1.1-1`, run live against Stalwart 1.1.1 (`tests/integration
 
 Test coverage for `1.1.1-2`: every tool except `spam_train` and `mail_bulk_junk` has now been run live against Stalwart 1.1.1, including `mail_send` and a draft whose From is the identity's address. Paths not exercised live: an enabled vacation response and the masked address quota error.
 
-Test coverage for `1.1.1-4`, run live against Stalwart 1.1.1, once each: `mail_bulk_junk`'s JMAP path (`test_bulk_junk`) passed: a draft was moved into Junk with `$junk` and back to Drafts, the server stored one training sample per move, and the test destroyed both, the draft, and confirmed the sample count was back to its prior value. `spam_train` (`test_spam_training`) reached the server with the corrected `x:SpamTrainingSample/set` call, which Stalwart refused with `forbidden` ("You are not authorized to create objects of this type") for a plain user account; nothing was created and the draft was removed. A successful `spam_train` has not been run live: it needs an account with the permission to create spam training samples, and the clearer error for this refusal was added after the run and is covered by unit tests only.
+Test coverage for `1.1.1-4`, run live against Stalwart 1.1.1, once each: `mail_bulk_junk`'s JMAP path (`test_bulk_junk`) passed: a draft was moved into Junk with `$junk` and back to Drafts, the server stored one training sample per move, and the test destroyed both, the draft, and confirmed the sample count was back to its prior value. `spam_train` (`test_spam_training`) reached the server with the corrected `x:SpamTrainingSample/set` call, which Stalwart refused with `forbidden` ("You are not authorized to create objects of this type") for a plain user account; nothing was created and the draft was removed. A successful `spam_train` has not been run live: it needs an account with the permission to create spam training samples, and the clearer error for this refusal was added after the run and is covered by unit tests only. Sieve activation (`sieve_put` with `activate: true`) has never been run live: the live tests store scripts inactive only and never activate one.
 
 ## Installation
 

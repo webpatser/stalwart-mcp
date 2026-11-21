@@ -27,6 +27,42 @@ const CREATE_ID: &str = "k0";
 pub const SIEVE_MEDIA_TYPE: &str = "application/sieve";
 /// Script name the server manages for the vacation response.
 pub const RESERVED_NAME: &str = "vacation";
+/// Fixed `{name}` for script downloads; the server-provided script name never
+/// enters the download URL.
+const DOWNLOAD_NAME: &str = "script.sieve";
+
+fn is_reserved(name: Option<&str>) -> bool {
+    name.is_some_and(|n| n.eq_ignore_ascii_case(RESERVED_NAME))
+}
+
+/// Whether an update by id may replace the existing script, decided from the
+/// target's current metadata before anything is uploaded. Refuses the
+/// server-managed `vacation` script (it belongs to `mail_vacation_set`), a
+/// rename to `vacation`, and replacing the active script without `activate`,
+/// because that changes live filtering.
+pub fn check_update_target(
+    existing_name: Option<&str>,
+    existing_is_active: bool,
+    activate: bool,
+    new_name: Option<&str>,
+) -> Result<(), AppError> {
+    if is_reserved(existing_name) {
+        return Err(AppError::Refused(
+            "the 'vacation' script is managed by the server for the vacation response; use mail_vacation_set".into(),
+        ));
+    }
+    if is_reserved(new_name) {
+        return Err(AppError::Refused(
+            "the name 'vacation' is reserved for the vacation response".into(),
+        ));
+    }
+    if existing_is_active && !activate {
+        return Err(AppError::Refused(
+            "this is the active script: replacing it changes live filtering immediately; repeat with 'activate: true' to confirm".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -185,13 +221,12 @@ impl JmapClient {
     pub async fn get_sieve_script(&self, id: &str) -> Result<SieveScriptContent, AppError> {
         let script = self.get_sieve_script_meta(id).await?;
         let raw = self.raw()?;
-        let name = script.name.as_deref().unwrap_or("script");
         let bytes = raw
             .download(
                 self.client.session().download_url(),
                 &script.blob_id,
                 SIEVE_MEDIA_TYPE,
-                name,
+                DOWNLOAD_NAME,
             )
             .await?;
         let content = String::from_utf8(bytes)
@@ -232,10 +267,21 @@ impl JmapClient {
         self.validate_blob(&raw, &blob_id).await
     }
 
-    /// Validate, then create or replace a script. A script the server does not
-    /// accept is refused before `SieveScript/set`. Activates only when
-    /// `put.activate` is true. Returns the stored script.
+    /// Validate, then create or replace a script. On replace the target is
+    /// fetched first and checked with [`check_update_target`]; an unknown id is
+    /// not found. A script the server does not accept is refused before
+    /// `SieveScript/set`. Activates only when `put.activate` is true. Returns
+    /// the stored script.
     pub async fn put_sieve_script(&self, put: &SievePut<'_>) -> Result<SieveScript, AppError> {
+        if let Some(id) = put.id {
+            let existing = self.get_sieve_script_meta(id).await?;
+            check_update_target(
+                existing.name.as_deref(),
+                existing.is_active,
+                put.activate,
+                put.name,
+            )?;
+        }
         let raw = self.raw()?;
         let blob_id = self.upload_sieve(&raw, put.content).await?;
         let validation = self.validate_blob(&raw, &blob_id).await?;
@@ -349,6 +395,49 @@ mod tests {
             invalid.error.as_deref(),
             Some("invalidScript: unexpected token")
         );
+    }
+
+    fn rejected(result: Result<(), AppError>, needle: &str) -> bool {
+        matches!(result, Err(AppError::Refused(ref m)) if m.contains(needle))
+    }
+
+    #[test]
+    fn update_of_an_inactive_script_is_allowed() {
+        assert!(check_update_target(Some("filters"), false, false, None).is_ok());
+        assert!(check_update_target(Some("filters"), false, true, Some("other")).is_ok());
+        assert!(check_update_target(None, false, false, None).is_ok());
+    }
+
+    #[test]
+    fn update_of_the_vacation_script_is_refused() {
+        for name in ["vacation", "Vacation", "VACATION"] {
+            for (active, activate) in [(false, false), (true, true), (false, true)] {
+                assert!(
+                    rejected(
+                        check_update_target(Some(name), active, activate, None),
+                        "mail_vacation_set"
+                    ),
+                    "{name} {active} {activate}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rename_to_vacation_is_refused() {
+        assert!(rejected(
+            check_update_target(Some("filters"), false, false, Some("Vacation")),
+            "reserved"
+        ));
+    }
+
+    #[test]
+    fn update_of_the_active_script_needs_activate() {
+        assert!(rejected(
+            check_update_target(Some("filters"), true, false, None),
+            "activate: true"
+        ));
+        assert!(check_update_target(Some("filters"), true, true, None).is_ok());
     }
 
     #[test]

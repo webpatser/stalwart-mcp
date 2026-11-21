@@ -39,7 +39,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = "1.1.1-3"
+VERSION = "1.1.1-4"
 ACCOUNT = "e2e"
 OTHER_ACCOUNT = "e2e-other"
 TS = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -56,7 +56,11 @@ EXPECTED_TOOLS = {
     "mail_bulk_delete", "mail_bulk_read", "spam_train",
     "mail_masked_list", "mail_masked_create", "mail_masked_disable",
     "mail_vacation_get", "mail_vacation_set", "quota_get", "identity_list",
+    "mail_get_thread", "contacts_search",
+    "sieve_list", "sieve_get", "sieve_validate", "sieve_put",
 }
+VALID_SIEVE = "keep;"
+BROKEN_SIEVE = "this is not a sieve script"
 
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+=-]+@[A-Za-z0-9.-]+")
 SENSITIVE_VARS = ["STALWART_PASSWORD", "STALWART_TEST_USER", "STALWART_TEST_URL",
@@ -476,6 +480,41 @@ def section_b(s, ctx):
         good = ok and json.loads(text).get("id") == rid
         check("B", "mail_get recent", good, "id matches" if good else text[:200])
 
+        ok, text = s.call("mail_get_thread", {"id": rid, "limit": 50})
+        msgs = json.loads(text).get("messages", []) if ok else []
+        good = ok and any(m.get("id") == rid for m in msgs)
+        check("B", "mail_get_thread contains the message", good,
+              f"{len(msgs)} messages" if ok else text[:200])
+
+    search = {"folder": roles.get("inbox"), "limit": 3}
+    ok, text = s.call("mail_search", search)
+    ok_s, text_s = s.call("mail_search", {**search, "snippets": True})
+    n = len(json.loads(text)) if ok else -1
+    n_s = len(json.loads(text_s)) if ok_s else -2
+    check("B", "mail_search snippets same count", ok and ok_s and n == n_s,
+          f"{n} vs {n_s}" if ok and ok_s else (text if not ok else text_s)[:200])
+
+    ok, text = s.call("contacts_search", {"limit": 5})
+    if ok:
+        check("B", "contacts_search", isinstance(json.loads(text), (list, dict)), "result returned")
+    else:
+        check("B", "contacts_search capability error", "contacts" in text.lower(), text[:120])
+
+    sv = s.call_json("sieve_list")
+    check("B", "sieve_list", isinstance(sv, list), f"{len(sv)} scripts")
+    # sieve_validate uploads a temporary blob the server expires; no script is stored.
+    v = s.call_json("sieve_validate", {"script": VALID_SIEVE})
+    check("B", "sieve_validate accepts keep;", v.get("valid") is True and not v.get("error"),
+          f"valid={v.get('valid')}")
+    v = s.call_json("sieve_validate", {"script": BROKEN_SIEVE})
+    check("B", "sieve_validate rejects a broken script",
+          v.get("valid") is False and bool(v.get("error")), f"valid={v.get('valid')}")
+    # Main config has no capabilities.sieve; the input also fails validation.
+    ok, text = s.call("sieve_put", {"name": "..", "script": BROKEN_SIEVE})
+    check("B", "sieve_put disabled", is_disabled_err(ok, text), text[:120])
+    after = s.call_json("sieve_list")
+    check("B", "sieve list unchanged by read-only checks", after == sv, f"{len(after)} scripts")
+
     q = s.call_json("quota_get")
     check("B", "quota_get", isinstance(q, list),
           f"{len(q)} quotas: {[(x.get('resourceType'), x.get('scope')) for x in q]}")
@@ -763,11 +802,12 @@ def gating_flow(ctx):
             ("mail_vacation_set", {"is_enabled": True}),
             ("spam_train", {"ids": [], "classification": "bogus"}),
             ("mail_bulk_delete", {"ids": ["e2e-nonexistent"], "permanent": True}),
+            ("sieve_put", {"name": "..", "script": BROKEN_SIEVE}),
         ]:
             ok, text = g.call(name, args)
             check("C", f"gated {name} disabled", is_disabled_err(ok, text), text[:120])
         for name in ["mail_list_folders", "identity_list", "mail_masked_list",
-                     "mail_vacation_get", "quota_get"]:
+                     "mail_vacation_get", "quota_get", "sieve_list"]:
             ok, text = g.call(name, {})
             check("C", f"gated {name} still works", ok, "ok" if ok else text[:120])
     finally:
@@ -908,6 +948,11 @@ def http_scope_checks():
     ok, text = http_tool_call(read_only, "mail_draft", {"to": "not-a-list"})
     check("D", "read-only token: mail_draft refused",
           not ok and "Forbidden" in text and "mail:modify" in text, text[:120])
+    ok, text = http_tool_call(read_only, "sieve_list", {})
+    check("D", "read-only token: sieve_list allowed", ok, "ok" if ok else text[:120])
+    ok, text = http_tool_call(read_only, "sieve_put", {"name": "..", "script": BROKEN_SIEVE})
+    check("D", "read-only token: sieve_put refused",
+          not ok and "Forbidden" in text and "mail:send" in text, text[:120])
 
     ok, text = http_tool_call(other, "mail_list_folders", {"account": ACCOUNT})
     check("D", "account-restricted token: other account refused",
@@ -947,7 +992,7 @@ def section_d(ctx):
                 {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).encode(),
                 token=token, session=sess, want_id=2)
             n = len((msg or {}).get("result", {}).get("tools", []))
-            check("D", "tools/list with JWT", st == 200 and n == ctx.get("tool_count", 19),
+            check("D", "tools/list with JWT", st == 200 and n == ctx.get("tool_count", len(EXPECTED_TOOLS)),
                   f"status={st} tools={n} initialized_status={st2} {e or ''}")
 
             if token:

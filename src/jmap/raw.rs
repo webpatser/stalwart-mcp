@@ -128,7 +128,7 @@ impl RawJmap {
         body: Vec<u8>,
     ) -> Result<UploadedBlob, AppError> {
         const WHAT: &str = "Blob upload";
-        let url = expand_template(upload_template, &[("accountId", &self.account_id)]);
+        let url = expand_template(upload_template, &[("accountId", &self.account_id)])?;
         let url = same_origin_url(&self.api_url, &url, WHAT)?;
         let response = self
             .http
@@ -174,7 +174,7 @@ impl RawJmap {
                 ("type", content_type),
                 ("name", name),
             ],
-        );
+        )?;
         let url = same_origin_url(&self.api_url, &url, WHAT)?;
         let response = self
             .http
@@ -232,17 +232,25 @@ fn percent_encode(value: &str) -> String {
 }
 
 /// Fill the `{variable}`s of a session URL template (RFC 6570 level 1),
-/// percent-encoding each value.
-pub fn expand_template(template: &str, vars: &[(&str, &str)]) -> String {
+/// percent-encoding each value (`%` included, so an encoded `%2e` stays
+/// literal). A value made only of dots is refused: as a path segment it would
+/// be resolved as `.` or `..` and move the URL to another path.
+pub fn expand_template(template: &str, vars: &[(&str, &str)]) -> Result<String, AppError> {
     let mut url = template.to_string();
     for (name, value) in vars {
+        if !value.is_empty() && value.bytes().all(|b| b == b'.') {
+            return Err(AppError::JmapRequest(format!(
+                "URL template value for {name} consists only of dots"
+            )));
+        }
         url = url.replace(&format!("{{{name}}}"), &percent_encode(value));
     }
-    url
+    Ok(url)
 }
 
 /// Resolve `candidate` against the API URL and require the same scheme, host
-/// and port, so credentials never go to another origin.
+/// and port and no user information, so credentials never go to another
+/// origin and the URL cannot carry its own.
 pub fn same_origin_url(api_url: &str, candidate: &str, what: &str) -> Result<url::Url, AppError> {
     let base = url::Url::parse(api_url)
         .map_err(|e| AppError::JmapRequest(format!("{what}: invalid API URL: {e}")))?;
@@ -253,6 +261,11 @@ pub fn same_origin_url(api_url: &str, candidate: &str, what: &str) -> Result<url
     if !web || target.origin() != base.origin() {
         return Err(AppError::JmapRequest(format!(
             "{what}: session URL is not on the JMAP API origin"
+        )));
+    }
+    if !target.username().is_empty() || target.password().is_some() {
+        return Err(AppError::JmapRequest(format!(
+            "{what}: session URL must not carry a username or password"
         )));
     }
     Ok(target)
@@ -523,11 +536,35 @@ mod tests {
                 ("name", "my script"),
                 ("type", "application/sieve"),
             ],
-        );
+        )
+        .expect("expanded");
         assert_eq!(
             url,
             "https://mail.example.com/jmap/download/a1/b%2F2/my%20script?accept=application%2Fsieve"
         );
+    }
+
+    #[test]
+    fn template_values_of_only_dots_are_refused() {
+        let template = "https://mail.example.com/jmap/download/{accountId}/{blobId}/{name}";
+        for bad in [".", "..", "...."] {
+            assert!(
+                matches!(
+                    expand_template(template, &[("accountId", "a1"), ("blobId", bad)]),
+                    Err(AppError::JmapRequest(_))
+                ),
+                "{bad}"
+            );
+        }
+        let url = expand_template(template, &[("name", "a..b"), ("blobId", ".b")])
+            .expect("dots with other characters");
+        assert!(url.ends_with("/.b/a..b"), "{url}");
+    }
+
+    #[test]
+    fn template_values_encode_percent_itself() {
+        let url = expand_template("https://h/d/{name}", &[("name", "%2e%2E")]).expect("expanded");
+        assert_eq!(url, "https://h/d/%252e%252E");
     }
 
     #[test]
@@ -548,6 +585,9 @@ mod tests {
             "https://mail.example.com.evil.test/",
             "//evil.example.com/x",
             "file:///etc/passwd",
+            "https://user:pw@mail.example.com/",
+            "https://user@mail.example.com/",
+            "https://:pw@mail.example.com/",
         ] {
             assert!(
                 matches!(

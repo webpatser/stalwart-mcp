@@ -1,10 +1,10 @@
 # Changelog
 
-## [1.1.1-4] - Unreleased
+## [1.1.1-4] - 2026-11-21
 
 ### Added
-- Sieve filter tools (JMAP `SieveScript`, RFC 9661): `sieve_list`, `sieve_get` (source downloaded from the script's blob) and `sieve_validate` (server-side compile, nothing stored), scope `mail:read`.
-- `sieve_put` creates a script or replaces one by `id`, scope `mail:send` because a script can redirect mail. Behind the new `capabilities.sieve` (default false), checked before any request reaches the mail server, as is the 64 KiB script size cap. The script is always validated first, is stored inactive unless `activate: true`, and the reserved name `vacation` is refused.
+- Sieve filter tools (JMAP `SieveScript`, RFC 9661): `sieve_list`, `sieve_get` (source downloaded from the script's blob) and `sieve_validate` (server-side compile, no script stored; the source is uploaded as a temporary blob the server expires, so the tool is rate-limited), scope `mail:read`.
+- `sieve_put` creates a script or replaces one by `id`, scope `mail:send` because a script can redirect mail. Behind the new `capabilities.sieve` (default false), checked before any request reaches the mail server, as are the 64 KiB script size cap and the name rules. The script is always validated first, is stored inactive unless `activate: true`, and the reserved name `vacation` is refused. Activation has never been run live; the live test stores its script inactive only.
 - `contacts_search` (JMAP `ContactCard/query`, `ContactCard/get` and `AddressBook/get`, RFC 9610), scope `mail:read`, read-only: searches the account's contacts by text (the server matches whole words in name, email, organisation and other card fields) and returns per contact only the name, email addresses, organisations and address book names. Only `id`, `name`, `emails`, `organizations` and `addressBookIds` are requested from the server. Default 20 results, at most 50. Fails with a clear error when the session lacks `urn:ietf:params:jmap:contacts`.
 - `mail_get_thread` (JMAP `Thread/get`, RFC 8621), scope `mail:read`: returns the conversation of a message as message summaries in the server's thread order, oldest first. Default 20 messages, at most 50; a longer thread returns the most recent ones plus an `omitted` count. An unknown message id is a not-found error.
 - `mail_search` takes an optional `snippets` argument (default false). When true, `SearchSnippet/get` runs for the returned results and each gets a `snippet` with highlighted `subject` and `preview`; the server's `<mark>` tags are kept as returned. Without it the output is unchanged.
@@ -13,7 +13,12 @@
 
 ### Fixed
 - `spam_train` called `SpamTrainingSample/set`, which Stalwart 1.1.1 does not dispatch: its registry objects are only reachable under the `x:` prefix (`jmap-proto/src/request/method.rs` at `v1.1.1`). It now calls `x:SpamTrainingSample/set` with `urn:stalwart:jmap` in `using`.
-- A method-level refusal of `spam_train` now reaches the MCP client with the server's reason instead of "Upstream request failed". On `forbidden` it adds that the account needs Stalwart's permission to create spam training samples (`sysSpamTrainingSampleCreate`), which a plain user account on Stalwart 1.1.1 does not have: the live run of `test_spam_training` was refused with exactly that error.
+- A method-level refusal of `spam_train` now reaches the MCP client with the server's reason instead of "Upstream request failed". On `forbidden` it adds that the account needs Stalwart's permission to create spam training samples (`sysSpamTrainingSampleCreate`), which a plain user account on Stalwart 1.1.1 does not have: the live run of `test_spam_training` was refused with exactly that error. A successful `spam_train` remains unproven live.
+
+### Security
+- `sieve_put` with an `id` now reads the target script before uploading anything: an unknown id is not found, the server-managed `vacation` script is refused (use `mail_vacation_set`), and replacing the active script, which changes live filtering immediately, is refused unless `activate: true`.
+- Script names for `sieve_put` are at most 128 bytes and may not be `.` or `..` or contain `/` or control characters. Script downloads use the fixed name `script.sieve` instead of the server-provided one, and a session URL template value made only of dots is refused.
+- Session upload and download URLs that carry a username or password are refused, in addition to the same-origin rule.
 
 ## [1.1.1-3] - 2026-11-21
 
