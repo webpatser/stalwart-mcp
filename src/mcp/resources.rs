@@ -1,14 +1,17 @@
 use crate::jmap::AccountManager;
 use std::sync::Arc;
 
-/// Build the accounts resource content (list of all configured accounts)
+/// Build the accounts resource content: every configured account, or only
+/// `only` when the caller is restricted to one account.
 pub async fn accounts_resource(
     manager: &Arc<AccountManager>,
+    only: Option<&str>,
 ) -> Result<String, crate::error::AppError> {
     let default_name = manager.default_name();
     let accounts: Vec<_> = manager
         .list()
         .iter()
+        .filter(|(name, _)| only.is_none_or(|allowed| *name == allowed))
         .map(|(name, client)| {
             serde_json::json!({
                 "name": name,

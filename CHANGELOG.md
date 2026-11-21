@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1-3] - Unreleased
+
+### Security
+- **Behaviour change:** JWT scopes and the `--account` restriction are now enforced (#3). Before, the claims were validated and then ignored, so any valid token could modify, send and reach every account. Every tool call and resource read is now checked at one point before it runs: read tools need `mail:read`; `mail_flag`, `mail_move`, `mail_draft`, `mail_bulk_read`, `mail_bulk_junk`, `mail_bulk_delete`, `mail_masked_create`, `mail_masked_disable` and `spam_train` need `mail:modify`; `mail_send` and `mail_vacation_set` need `mail:send`. Tokens created with the default `mail:read` lose write access; re-issue them with the scopes they need.
+- A token restricted to an account may only name that account; a call without `account` runs against it, and `mail://accounts` lists only that account. Unknown tool names are refused.
+- An HTTP request that reaches the MCP handler without an authorization context is refused (fail closed). Stdio and secret-less loopback HTTP stay unrestricted.
+- `token create` rejects unknown scope strings; accepted are `mail:read`, `mail:modify`, `mail:send` and `*`.
+
 ## [1.1.1-2] - 2026-11-20
 
 ### Fixed

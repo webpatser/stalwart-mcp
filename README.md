@@ -224,6 +224,16 @@ Generate a JWT token for remote access:
 stalwart-mcp token create --account "*" --scopes "mail:read,mail:modify" --expires 365
 ```
 
+Scopes and `--account` are enforced on every tool call and resource read. A token restricted to one account (`--account work`) may only name that account; a call without `account` is run against it, and the `mail://accounts` resource lists only that account. Accepted scopes are `mail:read`, `mail:modify`, `mail:send` and `*` (all); `token create` rejects anything else. Scopes do not imply each other: a token that drafts and reads needs `mail:read,mail:modify`. Reading resources needs `mail:read`. The default scope is `mail:read`, so a token created without `--scopes` is read-only.
+
+| Scope | Tools |
+|-------|-------|
+| `mail:read` | `mail_list_folders`, `mail_list_recent`, `mail_search`, `mail_get`, `mail_masked_list`, `mail_vacation_get`, `quota_get`, `identity_list` |
+| `mail:modify` | `mail_flag`, `mail_move`, `mail_draft`, `mail_bulk_read`, `mail_bulk_junk`, `mail_bulk_delete`, `mail_masked_create`, `mail_masked_disable`, `spam_train` |
+| `mail:send` | `mail_send`, `mail_vacation_set` (an enabled vacation response makes the server send auto-replies) |
+
+Capability flags in the config still apply on top of scopes. Over stdio and for loopback HTTP requests without `auth.secret` there is no token, so everything is allowed.
+
 Then configure your client to connect via HTTP:
 
 ```json
@@ -262,7 +272,7 @@ stalwart-mcp serve [OPTIONS]        Start the MCP server
 
 stalwart-mcp token create           Generate a JWT token
     --account <NAME>                Account name or "*" for all (default: *)
-    --scopes <SCOPES>               Comma-separated: mail:read,mail:modify,mail:send
+    --scopes <SCOPES>               Comma-separated: mail:read,mail:modify,mail:send or * (default: mail:read)
     --expires <DAYS>                Token expiry in days (default: 365)
 
 Global options:

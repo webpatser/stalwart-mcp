@@ -1,3 +1,4 @@
+use crate::mcp::authz::AuthContext;
 use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
@@ -83,11 +84,14 @@ pub fn generate_secret() -> String {
 pub async fn auth_middleware(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     axum::Extension(secret): axum::Extension<AuthSecret>,
-    request: Request<axum::body::Body>,
+    mut request: Request<axum::body::Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
+    // Every request that passes carries an AuthContext; the MCP handler refuses
+    // an HTTP request without one.
     // A configured secret also protects requests from a local reverse proxy.
     if addr.ip().is_loopback() && secret.0.is_empty() {
+        request.extensions_mut().insert(AuthContext::unrestricted());
         return Ok(next.run(request).await);
     }
 
@@ -108,7 +112,12 @@ pub async fn auth_middleware(
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
     match validate_token(&secret.0, token) {
-        Ok(_claims) => Ok(next.run(request).await),
+        Ok(claims) => {
+            request
+                .extensions_mut()
+                .insert(AuthContext::from_claims(&claims));
+            Ok(next.run(request).await)
+        }
         Err(e) => {
             tracing::warn!(error = %e, addr = %addr, "JWT validation failed");
             Err(StatusCode::UNAUTHORIZED)

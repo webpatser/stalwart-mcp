@@ -99,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 let secret = get_or_create_secret(&config)?;
                 let scopes: Vec<String> = scopes.split(',').map(|s| s.trim().to_string()).collect();
+                stalwart_mcp::mcp::authz::validate_scopes(&scopes)?;
 
                 let token = stalwart_mcp::auth::create_token(&secret, &account, &scopes, expires)?;
 
@@ -248,21 +249,41 @@ mod http_tests {
         extract::ConnectInfo,
         http::{Request, StatusCode},
     };
+    use rmcp::model::{CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock};
+    use rmcp::service::RequestContext;
+    use rmcp::{ErrorData, RoleServer};
     use stalwart_mcp::config::{AuthConfig, ServerConfig};
+    use stalwart_mcp::mcp::authz;
     use tower::ServiceExt;
 
+    const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"regression-test","version":"1"}}}"#;
+    const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+
+    /// Test server with the same authorization choke point as `StalwartMcp::call_tool`.
+    /// Any tool name from the scope table "runs" and reports the account it got.
     #[derive(Clone)]
     struct TestServer;
-    impl rmcp::ServerHandler for TestServer {}
+    impl rmcp::ServerHandler for TestServer {
+        async fn call_tool(
+            &self,
+            mut request: CallToolRequestParams,
+            context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, ErrorData> {
+            authz::resolve(&context)?.authorize_tool_call(&mut request)?;
+            let account = request
+                .arguments
+                .as_ref()
+                .and_then(|args| args.get("account"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("default")
+                .to_string();
+            let text = format!("ran {} on {account}", request.name);
+            Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
+        }
+    }
 
-    async fn request(
-        local: bool,
-        secret: &str,
-        token: Option<&str>,
-        host: &str,
-        hosts: Vec<String>,
-    ) -> StatusCode {
-        let router = http_router(
+    fn test_router(secret: &str, hosts: Vec<String>) -> axum::Router {
+        http_router(
             TestServer,
             &AuthConfig {
                 secret: Some(secret.into()),
@@ -271,7 +292,18 @@ mod http_tests {
                 allowed_hosts: hosts,
                 ..Default::default()
             },
-        );
+        )
+    }
+
+    /// Send one POST to `/mcp` with optional extra headers and a JSON-RPC body.
+    async fn send(
+        router: &axum::Router,
+        local: bool,
+        token: Option<&str>,
+        host: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> axum::response::Response {
         let mut request = Request::builder()
             .method("POST")
             .uri("/mcp")
@@ -281,7 +313,10 @@ mod http_tests {
         if let Some(token) = token {
             request = request.header("authorization", format!("Bearer {token}"));
         }
-        let mut request = request.body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"regression-test","version":"1"}}}"#)).unwrap();
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut request = request.body(Body::from(body.to_string())).unwrap();
         let addr = if local {
             "127.0.0.1:1234"
         } else {
@@ -290,7 +325,104 @@ mod http_tests {
         request
             .extensions_mut()
             .insert(ConnectInfo(addr.parse::<SocketAddr>().unwrap()));
-        router.oneshot(request).await.unwrap().status()
+        router.clone().oneshot(request).await.unwrap()
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("response body did not finish")
+        .unwrap();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    async fn request(
+        local: bool,
+        secret: &str,
+        token: Option<&str>,
+        host: &str,
+        hosts: Vec<String>,
+    ) -> StatusCode {
+        send(
+            &test_router(secret, hosts),
+            local,
+            token,
+            host,
+            &[],
+            INITIALIZE,
+        )
+        .await
+        .status()
+    }
+
+    /// Initialize a session and call one tool; returns the response body text.
+    async fn call_tool(
+        local: bool,
+        secret: &str,
+        token: Option<&str>,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> String {
+        let router = test_router(secret, vec![]);
+        let init = send(&router, local, token, "localhost", &[], INITIALIZE).await;
+        assert_eq!(init.status(), StatusCode::OK);
+        let session = init
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("session id")
+            .to_string();
+        body_text(init).await;
+        let headers = [
+            ("mcp-session-id", session.as_str()),
+            ("mcp-protocol-version", "2025-03-26"),
+        ];
+        let ack = send(&router, local, token, "localhost", &headers, INITIALIZED).await;
+        assert!(ack.status().is_success(), "initialized: {}", ack.status());
+        let call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": args },
+        })
+        .to_string();
+        let response = send(&router, local, token, "localhost", &headers, &call).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    #[tokio::test]
+    async fn scopes_and_account_restriction_over_http() {
+        let secret = "test-secret-used-only-in-tests";
+        let token = |account: &str, scopes: &[&str]| {
+            let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+            stalwart_mcp::auth::create_token(secret, account, &scopes, 1).unwrap()
+        };
+        let empty = serde_json::json!({});
+
+        let read_only = token("*", &["mail:read"]);
+        let body = call_tool(false, secret, Some(&read_only), "mail_get", empty.clone()).await;
+        assert!(body.contains("ran mail_get on default"), "{body}");
+        let body = call_tool(false, secret, Some(&read_only), "mail_flag", empty.clone()).await;
+        assert!(body.contains("Forbidden"), "{body}");
+        assert!(!body.contains("ran mail_flag"), "{body}");
+
+        let work = token("work", &["mail:read"]);
+        let other = serde_json::json!({ "account": "personal" });
+        let body = call_tool(false, secret, Some(&work), "mail_get", other.clone()).await;
+        assert!(body.contains("Forbidden"), "{body}");
+        let body = call_tool(false, secret, Some(&work), "mail_get", empty.clone()).await;
+        assert!(body.contains("ran mail_get on work"), "{body}");
+
+        let all = token("*", &["*"]);
+        let body = call_tool(false, secret, Some(&all), "mail_flag", other.clone()).await;
+        assert!(body.contains("ran mail_flag on personal"), "{body}");
+
+        let body = call_tool(true, "", None, "mail_send", other).await;
+        assert!(body.contains("ran mail_send on personal"), "{body}");
     }
 
     #[tokio::test]
