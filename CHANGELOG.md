@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- README: new "Connecting a client" section replaces the scattered client snippets (Claude Code, Claude Desktop, other stdio clients, HTTP with tokens); the examples no longer put the password in a client config file.
+
 ## [1.1.1-4] - 2026-11-21
 
 ### Added

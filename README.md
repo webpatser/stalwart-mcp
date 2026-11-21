@@ -172,78 +172,132 @@ export STALWART_PASSWORD="your-password"
 export STALWART_PASSWORD_WORK="work-password"
 ```
 
-## Connecting to AI assistants
+## Connecting a client
 
-### Claude Code (CLI)
+This is the one place for client setup. Stdio is the default for local use; HTTP is for remote or shared use.
 
-Add to your project's `.mcp.json`:
+### Prerequisites
+
+- The binary is installed (`cargo install --path . --locked`, see [Installation](#installation)), by default at `~/.cargo/bin/stalwart-mcp`.
+- A config file whose accounts read the password from an environment variable (`password_env`, see [Configuration](#configuration)).
+
+### Recommended local layout
+
+Keep the password out of every client config file. The config holds no password, and a small env file exports only the password variable:
+
+```
+~/.config/stalwart-mcp/config.toml     mode 0600, accounts with password_env
+~/.config/stalwart-mcp/personal.env    mode 0600, exports only the password variable
+```
+
+```bash
+mkdir -p ~/.config/stalwart-mcp
+cat > ~/.config/stalwart-mcp/personal.env <<'ENV'
+STALWART_PASSWORD='your-password'
+ENV
+chmod 600 ~/.config/stalwart-mcp/personal.env ~/.config/stalwart-mcp/config.toml
+```
+
+```toml
+[[accounts]]
+name = "personal"
+url = "https://mail.example.org"
+username = "you@example.org"
+# password_env defaults to STALWART_PASSWORD
+```
+
+The clients below start the server through `/bin/sh -c`, which sources the env file (`set -a` exports every variable it defines), then `exec`s the binary:
+
+```sh
+set -a; . "$HOME/.config/stalwart-mcp/personal.env"; set +a; exec "$HOME/.cargo/bin/stalwart-mcp" --config "$HOME/.config/stalwart-mcp/config.toml" serve --stdio
+```
+
+### Claude Code
+
+**Project scope**: add to `.mcp.json` in the project root.
 
 ```json
 {
   "mcpServers": {
     "stalwart": {
       "type": "stdio",
-      "command": "/path/to/stalwart-mcp",
-      "args": ["serve"],
-      "env": {
-        "STALWART_PASSWORD": "<your-password>"
-      }
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "set -a; . \"$HOME/.config/stalwart-mcp/personal.env\"; set +a; exec \"$HOME/.cargo/bin/stalwart-mcp\" --config \"$HOME/.config/stalwart-mcp/config.toml\" serve --stdio"
+      ]
     }
   }
 }
 ```
+
+- Keep `.mcp.json` git-ignored if it is machine-specific (this repository's `.gitignore` already does).
+- Claude Code asks once to approve a project server.
+- Start a new session afterwards; running sessions do not pick up the change.
+
+**User scope** (all projects), the same wrapper through `claude mcp add`:
+
+```bash
+claude mcp add --scope user stalwart -- /bin/sh -c 'set -a; . "$HOME/.config/stalwart-mcp/personal.env"; set +a; exec "$HOME/.cargo/bin/stalwart-mcp" --config "$HOME/.config/stalwart-mcp/config.toml" serve --stdio'
+```
+
+**Check**: run `claude mcp list` in a shell, or `/mcp` inside a session. `stalwart` should show as connected.
 
 ### Claude Desktop
 
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+Open Settings, Developer, Edit Config, or edit the file directly:
+
+| OS | File |
+|----|------|
+| macOS | `~/Library/Application Support/Claude/claude_desktop_config.json` |
+| Windows | `%APPDATA%\Claude\claude_desktop_config.json` |
 
 ```json
 {
   "mcpServers": {
     "stalwart": {
-      "command": "stalwart-mcp",
-      "args": ["serve"],
-      "env": {
-        "STALWART_PASSWORD": "<your-password>"
-      }
+      "command": "/bin/sh",
+      "args": [
+        "-c",
+        "set -a; . \"$HOME/.config/stalwart-mcp/personal.env\"; set +a; exec \"$HOME/.cargo/bin/stalwart-mcp\" --config \"$HOME/.config/stalwart-mcp/config.toml\" serve --stdio"
+      ]
     }
   }
 }
 ```
 
-### Cursor
+Desktop does not expand `$HOME` in `command`, so the wrapper script does it. Restart Desktop afterwards.
 
-Add to `.cursor/mcp.json` in your project:
+The `/bin/sh` wrapper is for macOS and Linux. On Windows, point `command` at the binary, put `--config <path>`, `serve` and `--stdio` in `args`, and carry the password variable in the entry's `env` block (for example `"env": { "STALWART_PASSWORD": "your-password" }`); that file then contains the password, so keep it private.
 
-```json
-{
-  "mcpServers": {
-    "stalwart": {
-      "command": "stalwart-mcp",
-      "args": ["serve"],
-      "env": {
-        "STALWART_PASSWORD": "<your-password>"
-      }
-    }
-  }
-}
-```
+### Other MCP clients (stdio)
 
-### Remote mode (HTTP with JWT)
+- Command: `stalwart-mcp` (or its full path), or the `/bin/sh -c` wrapper above.
+- Args: `--config <path> serve --stdio` (`--config` defaults to `~/.config/stalwart-mcp/config.toml`).
+- Environment: the variable named by `password_env` (default `STALWART_PASSWORD`) must be set for the process the client launches.
 
-For remote deployment, run as an HTTP server:
+### Remote or shared use over HTTP
 
-```bash
-stalwart-mcp serve --bind 127.0.0.1:3000
-```
+1. Set `auth.secret` in the config (`[auth]`, `secret = "..."`). If none is set, the first `token create` generates one and prints the `[auth]` block to add.
+2. Start the server:
 
-Generate a JWT token for remote access:
+   ```bash
+   stalwart-mcp serve --bind 127.0.0.1:3000
+   ```
 
-```bash
-stalwart-mcp token create --account "*" --scopes "mail:read,mail:modify" --expires 365
-```
+3. Create a token with only the scopes the client needs:
 
-Scopes and `--account` are enforced on every tool call and resource read. A token restricted to one account (`--account work`) may only name that account; a call without `account` is run against it, and the `mail://accounts` resource lists only that account. Accepted scopes are `mail:read`, `mail:modify`, `mail:send` and `*` (all); `token create` rejects anything else. Scopes do not imply each other: a token that drafts and reads needs `mail:read,mail:modify`. Reading resources needs `mail:read`. The default scope is `mail:read`, so a token created without `--scopes` is read-only.
+   ```bash
+   stalwart-mcp token create --account "*" --scopes "mail:read,mail:modify" --expires 365
+   ```
+
+4. Connect with a streamable HTTP client at `https://mcp.example.org/mcp` sending `Authorization: Bearer <token>`. In Claude Code:
+
+   ```bash
+   claude mcp add --transport http stalwart https://mcp.example.org/mcp --header "Authorization: Bearer <token>"
+   ```
+
+Scopes and `--account` are enforced on every tool call and resource read. A token restricted to one account (`--account work`) may only name that account; a call without `account` is run against it, and the `mail://accounts` resource lists only that account. Accepted scopes are `mail:read`, `mail:modify`, `mail:send` and `*` (all); `token create` rejects anything else. Scopes do not imply each other: a token that drafts and reads needs `mail:read,mail:modify`. Reading resources needs `mail:read`. The default scope is `mail:read`, so a token created without `--scopes` is read-only: it cannot modify or send.
 
 | Scope | Tools |
 |-------|-------|
@@ -253,23 +307,20 @@ Scopes and `--account` are enforced on every tool call and resource read. A toke
 
 Capability flags in the config still apply on top of scopes. Over stdio and for loopback HTTP requests without `auth.secret` there is no token, so everything is allowed.
 
-Then configure your client to connect via HTTP:
-
-```json
-{
-  "mcpServers": {
-    "stalwart": {
-      "url": "https://your-server:3000/mcp",
-      "authentication": {
-        "type": "bearer",
-        "token": "<jwt-token-from-above>"
-      }
-    }
-  }
-}
-```
-
 **Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, a request arriving from loopback is trusted and all others are rejected. A reverse proxy on the same host makes every request arrive from loopback, so without a secret, a loopback request that carries any of `Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `Via`, `CF-Connecting-IP`, `True-Client-IP` or `X-Client-IP` (any value, any casing) is rejected with 401 and a warning naming `auth.secret`. This closes the common case of an nginx, caddy or Cloudflare setup that adds one of those headers. It cannot detect a proxy that adds none of them: such a proxy (nginx `proxy_pass http://127.0.0.1:3000` without `proxy_set_header`, which also forwards a loopback Host by default) still gets through unauthenticated. HTTP mode also refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty. Always set `auth.secret` when the server sits behind a reverse proxy or is reachable by anything other than local clients. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
+
+### What each client can do
+
+Every client gets the same tools, limited by the token scopes over HTTP. The capability flags in the config (`send`, `delete`, `sieve`, `vacation`, `masked_email`, `spam_training`) are off unless you enable them, see [Configuration](#configuration) and the tool table under [Tools](#tools).
+
+### Troubleshooting
+
+- Tools do not appear: restart the client (Claude Code needs a new session), approve the project server when asked, and run `claude mcp list`.
+- Authentication failed or `Environment variable 'STALWART_PASSWORD' not set`: the password variable is not set in the environment the client launches; check the env file path in the wrapper.
+- 401 over HTTP: the token is missing or expired, or a proxy forwarded headers while no `auth.secret` is set.
+- `Forbidden: this token lacks the '<scope>' scope`: create a new token with that scope.
+- A tool says it is disabled (for example `Sending emails is disabled`): enable its flag under `[capabilities]` and restart the server.
+- Logs: the server writes tracing output to stderr only (stdout carries the protocol); the level comes from `RUST_LOG`, default `info`. The client decides where stderr goes.
 
 ## Example interactions
 
