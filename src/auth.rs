@@ -136,7 +136,20 @@ pub async fn auth_middleware(
 }
 
 /// Headers a reverse proxy adds to say the request came from somewhere else.
-const FORWARDING_HEADERS: [&str; 3] = ["forwarded", "x-forwarded-for", "x-real-ip"];
+/// A proxy that adds none of these is indistinguishable from a local client,
+/// so a secret stays mandatory behind any proxy.
+const FORWARDING_HEADERS: [&str; 10] = [
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "via",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "x-client-ip",
+];
 
 /// True when the request carries any proxy forwarding header, whatever its
 /// value (even empty). `HeaderMap` lookups are case-insensitive.
@@ -164,6 +177,13 @@ mod tests {
             "x-real-ip",
             "X-REAL-IP",
             "x-forwarded-for",
+            "X-Forwarded-Host",
+            "x-forwarded-proto",
+            "X-Forwarded-Port",
+            "Via",
+            "CF-Connecting-IP",
+            "True-Client-IP",
+            "X-Client-IP",
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -173,8 +193,8 @@ mod tests {
             assert!(is_forwarded(&headers), "{name}");
         }
         let mut headers = HeaderMap::new();
-        headers.insert("x-forwarded-host", HeaderValue::from_static("a"));
-        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        headers.insert("x-request-id", HeaderValue::from_static("a"));
+        headers.insert("user-agent", HeaderValue::from_static("test"));
         assert!(!is_forwarded(&headers));
     }
 }

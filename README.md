@@ -254,7 +254,7 @@ Then configure your client to connect via HTTP:
 }
 ```
 
-**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, a request arriving from loopback is trusted and all others are rejected. A reverse proxy on the same host makes every request arrive from loopback, so without a secret, a loopback request that carries a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header (any value, any casing) is rejected with 401 and a warning naming `auth.secret`. This closes the common case of an nginx or caddy setup that adds those headers. It cannot detect a proxy that strips them or never sets them: such a proxy (nginx `proxy_pass http://127.0.0.1:3000` without `proxy_set_header`, which also forwards a loopback Host by default) still gets through unauthenticated. HTTP mode also refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty. Always set `auth.secret` when the server sits behind a reverse proxy or is reachable by anything other than local clients. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
+**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, a request arriving from loopback is trusted and all others are rejected. A reverse proxy on the same host makes every request arrive from loopback, so without a secret, a loopback request that carries any of `Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `Via`, `CF-Connecting-IP`, `True-Client-IP` or `X-Client-IP` (any value, any casing) is rejected with 401 and a warning naming `auth.secret`. This closes the common case of an nginx, caddy or Cloudflare setup that adds one of those headers. It cannot detect a proxy that adds none of them: such a proxy (nginx `proxy_pass http://127.0.0.1:3000` without `proxy_set_header`, which also forwards a loopback Host by default) still gets through unauthenticated. HTTP mode also refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty. Always set `auth.secret` when the server sits behind a reverse proxy or is reachable by anything other than local clients. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
 
 ## Example interactions
 
@@ -322,6 +322,8 @@ export STALWART_TEST_USER="user@example.com"
 export STALWART_PASSWORD="your-password"
 python3 -I scripts/e2e.py
 ```
+
+During the run a secret-less instance listens on a loopback port with access to the test mailbox, so run it only on a single-user machine.
 
 It covers the initialize handshake and version, tools, prompts and resources; every read tool; the draft lifecycle (flags, move, bulk read, both `mail_bulk_delete` modes); masked email create, disable and destroy; a disabled vacation response with restore; capability gates; and over HTTP: JWT required, tampered token and foreign Host refused, a read-only token refused on `mail_draft`, an account-restricted token refused another account, a forwarded request refused without a secret, and a body over 2 MB answered with 413.
 

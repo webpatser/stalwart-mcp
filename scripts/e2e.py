@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -265,6 +266,31 @@ def tool_result(r):
 
 # ---------------------------------------------------------------- direct JMAP
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect, so the Basic credential is never sent to its target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _open_no_redirect(req):
+    """Open `req` without following redirects; any 3xx is a failure."""
+    try:
+        r = _NO_REDIRECT_OPENER.open(req, timeout=30)
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            e.close()
+            raise RuntimeError(f"JMAP request redirected ({e.code}); refusing to follow") from None
+        raise
+    if 300 <= r.status < 400:
+        r.close()
+        raise RuntimeError(f"JMAP request redirected ({r.status}); refusing to follow")
+    return r
+
+
 class Jmap:
     """Minimal JMAP caller for cleanup steps that have no (enabled) MCP tool."""
 
@@ -276,7 +302,7 @@ class Jmap:
         cred = f'{os.environ["STALWART_TEST_USER"]}:{os.environ["STALWART_PASSWORD"]}'
         self.auth = "Basic " + base64.b64encode(cred.encode()).decode()
         req = urllib.request.Request(url, headers={"Authorization": self.auth})
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _open_no_redirect(req) as r:
             if urllib.parse.urlparse(r.geturl()).hostname != self.host:
                 raise RuntimeError("session redirected to another host")
             session = json.load(r)
@@ -292,7 +318,7 @@ class Jmap:
         }).encode()
         req = urllib.request.Request(self.api, data=body, method="POST", headers={
             "Authorization": self.auth, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _open_no_redirect(req) as r:
             resp = json.load(r)
         name, out, _ = resp["methodResponses"][0]
         if name == "error":
@@ -926,6 +952,8 @@ def section_d(ctx):
             for hdrs in [[("X-Forwarded-For", "198.51.100.7")],
                          [("forwarded", "for=198.51.100.7")],
                          [("X-REAL-IP", "198.51.100.7")],
+                         [("X-Forwarded-Proto", "https")],
+                         [("Via", "1.1 proxy")],
                          [("X-Forwarded-For", "127.0.0.1"), ("x-forwarded-for", "198.51.100.7")]]:
                 st, _, _, e = http_post("/mcp", init, headers=hdrs)
                 check("D", f"no secret: forwarded {[n for n, _ in hdrs]} = 401", st == 401,

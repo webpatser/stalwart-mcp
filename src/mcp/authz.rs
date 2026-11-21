@@ -200,16 +200,36 @@ fn account_refused() -> ErrorData {
     )
 }
 
+/// The transport a server instance was built for. Authorization is decided by
+/// this, never by the shape of an individual request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// Local stdio: the client is the process owner, full access.
+    Stdio,
+    /// Streamable HTTP: every request must carry an [`AuthContext`].
+    Http,
+}
+
+/// A server handler that can be switched to a transport, so the HTTP service
+/// factory can force [`Transport::Http`] on every instance it hands out.
+pub trait WithTransport {
+    fn with_transport(self, transport: Transport) -> Self;
+}
+
 /// Resolve the caller's permissions from MCP request extensions.
 ///
-/// No `Parts` means the request did not come over HTTP (stdio): unrestricted.
-/// `Parts` without an [`AuthContext`] means the middleware did not run: denied.
-pub fn resolve_from_extensions(extensions: &Extensions) -> Result<AuthContext, ErrorData> {
-    match extensions.get::<Parts>() {
-        None => Ok(AuthContext::unrestricted()),
-        Some(parts) => parts
-            .extensions
-            .get::<AuthContext>()
+/// `Stdio` is unrestricted. `Http` requires the request's `Parts` carrying an
+/// [`AuthContext`] from the middleware; a missing `Parts` or a missing context
+/// is denied (fail closed).
+pub fn resolve_from_extensions(
+    transport: Transport,
+    extensions: &Extensions,
+) -> Result<AuthContext, ErrorData> {
+    match transport {
+        Transport::Stdio => Ok(AuthContext::unrestricted()),
+        Transport::Http => extensions
+            .get::<Parts>()
+            .and_then(|parts| parts.extensions.get::<AuthContext>())
             .cloned()
             .ok_or_else(|| {
                 tracing::error!("HTTP request without auth context; refusing");
@@ -219,8 +239,11 @@ pub fn resolve_from_extensions(extensions: &Extensions) -> Result<AuthContext, E
 }
 
 /// Resolve the caller's permissions for a request context.
-pub fn resolve(context: &RequestContext<RoleServer>) -> Result<AuthContext, ErrorData> {
-    resolve_from_extensions(&context.extensions)
+pub fn resolve(
+    transport: Transport,
+    context: &RequestContext<RoleServer>,
+) -> Result<AuthContext, ErrorData> {
+    resolve_from_extensions(transport, &context.extensions)
 }
 
 #[cfg(test)]
@@ -244,6 +267,62 @@ mod tests {
         request
     }
 
+    /// Collect every schema property whose name contains "account", at any depth
+    /// (nested objects, `items`, `$defs`, combinators), except the root's own
+    /// `properties.account`.
+    fn collect_account_like_properties(schema: &Value, out: &mut Vec<String>) {
+        fn walk(value: &Value, root: bool, path: &str, out: &mut Vec<String>) {
+            match value {
+                Value::Object(map) => {
+                    for (key, child) in map {
+                        if key == "properties"
+                            && let Value::Object(props) = child
+                        {
+                            for (name, sub) in props {
+                                let here = format!("{path}/{name}");
+                                let allowed = root && name == "account";
+                                if !allowed && name.to_ascii_lowercase().contains("account") {
+                                    out.push(here.clone());
+                                }
+                                walk(sub, false, &here, out);
+                            }
+                        } else {
+                            walk(child, false, &format!("{path}/{key}"), out);
+                        }
+                    }
+                }
+                Value::Array(items) => {
+                    for (i, item) in items.iter().enumerate() {
+                        walk(item, false, &format!("{path}/{i}"), out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(schema, true, "", out);
+    }
+
+    #[test]
+    fn account_like_property_detection() {
+        let mut out = Vec::new();
+        collect_account_like_properties(
+            &json!({"properties": {"account": {"type": "string"}, "id": {}}}),
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        for bad in [
+            json!({"properties": {"account": {}, "from_account": {}}}),
+            json!({"properties": {"targetAccount": {}}}),
+            json!({"properties": {"opts": {"properties": {"account": {}}}}}),
+            json!({"properties": {}, "$defs": {"X": {"properties": {"account_id": {}}}}}),
+            json!({"properties": {"list": {"items": {"properties": {"Account": {}}}}}}),
+        ] {
+            let mut out = Vec::new();
+            collect_account_like_properties(&bad, &mut out);
+            assert!(!out.is_empty(), "{bad}");
+        }
+    }
+
     #[test]
     fn every_router_tool_has_a_scope_and_an_account_property() {
         let router = StalwartMcp::create_tool_router() + StalwartMcp::create_account_tool_router();
@@ -263,6 +342,18 @@ mod tests {
             assert!(
                 has_account,
                 "tool '{}' has no 'account' property",
+                tool.name
+            );
+            // The account rule only inspects top-level `account`; any other
+            // account-like selector anywhere in the schema would bypass it.
+            let mut stray = Vec::new();
+            collect_account_like_properties(
+                &Value::Object((*tool.input_schema).clone()),
+                &mut stray,
+            );
+            assert!(
+                stray.is_empty(),
+                "tool '{}' has account-like properties outside top-level 'account': {stray:?}",
                 tool.name
             );
         }
@@ -370,24 +461,33 @@ mod tests {
     }
 
     #[test]
-    fn resolve_is_unrestricted_without_parts_and_closed_without_context() {
-        assert_eq!(
-            resolve_from_extensions(&Extensions::new()).unwrap(),
-            AuthContext::unrestricted()
-        );
-
-        let (parts, ()) = axum::http::Request::new(()).into_parts();
-        let mut ext = Extensions::new();
-        ext.insert(parts);
-        assert!(resolve_from_extensions(&ext).is_err());
-
-        let mut request = axum::http::Request::new(());
+    fn resolve_follows_the_transport_and_fails_closed_over_http() {
         let restricted = ctx(AccountScope::Named("work".into()), &["mail:read"]);
+        let mut request = axum::http::Request::new(());
         request.extensions_mut().insert(restricted.clone());
-        let (parts, ()) = request.into_parts();
-        let mut ext = Extensions::new();
-        ext.insert(parts);
-        assert_eq!(resolve_from_extensions(&ext).unwrap(), restricted);
+        let (with_context, ()) = request.into_parts();
+        let mut full = Extensions::new();
+        full.insert(with_context);
+
+        let (bare, ()) = axum::http::Request::new(()).into_parts();
+        let mut no_context = Extensions::new();
+        no_context.insert(bare);
+
+        // Stdio is unrestricted whatever the request carries.
+        for ext in [&Extensions::new(), &no_context, &full] {
+            assert_eq!(
+                resolve_from_extensions(Transport::Stdio, ext).unwrap(),
+                AuthContext::unrestricted()
+            );
+        }
+
+        // Http: no Parts is denied, Parts without a context is denied.
+        assert!(resolve_from_extensions(Transport::Http, &Extensions::new()).is_err());
+        assert!(resolve_from_extensions(Transport::Http, &no_context).is_err());
+        assert_eq!(
+            resolve_from_extensions(Transport::Http, &full).unwrap(),
+            restricted
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@ pub mod tools;
 
 use crate::config::{Capabilities, NotificationsConfig};
 use crate::jmap::AccountManager;
-use crate::mcp::authz::Scope;
+use crate::mcp::authz::{Scope, Transport, WithTransport};
 use crate::mcp::resources::{ResourceMatch, match_resource_uri};
 use crate::rate_limit::RateLimiters;
 use rmcp::handler::server::router::prompt::PromptRouter;
@@ -35,6 +35,7 @@ pub struct StalwartMcp {
     pub(crate) capabilities: Capabilities,
     pub(crate) notifications: NotificationsConfig,
     pub(crate) rate_limiters: Arc<RateLimiters>,
+    transport: Transport,
     tool_router: ToolRouter<Self>,
     prompt_router: PromptRouter<Self>,
 }
@@ -44,15 +45,22 @@ impl StalwartMcp {
         accounts: AccountManager,
         capabilities: Capabilities,
         notifications: NotificationsConfig,
+        transport: Transport,
     ) -> Self {
         Self {
             accounts: Arc::new(accounts),
             capabilities,
             notifications,
             rate_limiters: Arc::new(RateLimiters::new()),
+            transport,
             tool_router: Self::create_tool_router() + Self::create_account_tool_router(),
             prompt_router: Self::create_prompt_router(),
         }
+    }
+
+    /// The transport this instance authorizes requests for.
+    pub fn transport(&self) -> Transport {
+        self.transport
     }
 
     pub fn accounts(&self) -> &Arc<AccountManager> {
@@ -61,6 +69,13 @@ impl StalwartMcp {
 
     pub fn notifications_config(&self) -> &NotificationsConfig {
         &self.notifications
+    }
+}
+
+impl WithTransport for StalwartMcp {
+    fn with_transport(mut self, transport: Transport) -> Self {
+        self.transport = transport;
+        self
     }
 }
 
@@ -86,7 +101,7 @@ impl ServerHandler for StalwartMcp {
         mut request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        authz::resolve(&context)?.authorize_tool_call(&mut request)?;
+        authz::resolve(self.transport, &context)?.authorize_tool_call(&mut request)?;
         let tcc = ToolCallContext::new(self, request, context);
         self.tool_router.call(tcc).await
     }
@@ -96,7 +111,7 @@ impl ServerHandler for StalwartMcp {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        authz::resolve(&context)?.require(Scope::Read)?;
+        authz::resolve(self.transport, &context)?.require(Scope::Read)?;
         let accounts = Resource::new("mail://accounts", "Configured mail accounts")
             .with_description(
                 "List of all configured Stalwart accounts with id, username, and default status",
@@ -129,7 +144,7 @@ impl ServerHandler for StalwartMcp {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        let auth = authz::resolve(&context)?;
+        let auth = authz::resolve(self.transport, &context)?;
         auth.require(Scope::Read)?;
         let uri = &request.uri;
 

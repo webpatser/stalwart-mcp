@@ -5,6 +5,7 @@ use tracing_subscriber::EnvFilter;
 use stalwart_mcp::config::AppConfig;
 use stalwart_mcp::jmap::AccountManager;
 use stalwart_mcp::mcp::StalwartMcp;
+use stalwart_mcp::mcp::authz::{Transport, WithTransport};
 
 #[derive(Parser)]
 #[command(
@@ -83,7 +84,14 @@ async fn main() -> anyhow::Result<()> {
                 AccountManager::connect_all(&config.accounts, config.default_account.as_deref())
                     .await?;
 
-            let server = StalwartMcp::new(manager, config.capabilities, config.notifications);
+            // Built for stdio; the HTTP service factory switches every instance it
+            // hands out to `Transport::Http`.
+            let server = StalwartMcp::new(
+                manager,
+                config.capabilities,
+                config.notifications,
+                Transport::Stdio,
+            );
 
             if let Some(addr) = bind {
                 serve_http(server, &addr, &config.auth, &config.server).await?;
@@ -197,7 +205,7 @@ async fn serve_http(
 use std::net::SocketAddr;
 
 fn http_router(
-    server: impl rmcp::ServerHandler + Clone,
+    server: impl rmcp::ServerHandler + WithTransport + Clone,
     auth_config: &stalwart_mcp::config::AuthConfig,
     server_config: &stalwart_mcp::config::ServerConfig,
 ) -> axum::Router {
@@ -221,7 +229,7 @@ fn http_router(
     }
 
     let service = StreamableHttpService::new(
-        move || Ok(server.clone()),
+        move || Ok(server.clone().with_transport(Transport::Http)),
         Arc::new(LocalSessionManager::default()),
         transport_config,
     );
@@ -256,15 +264,21 @@ mod http_tests {
 
     /// Test server with the same authorization choke point as `StalwartMcp::call_tool`.
     /// Any tool name from the scope table "runs" and reports the account it got.
+    /// Built as `Stdio` like the real server; `http_router` must switch it to `Http`.
     #[derive(Clone)]
-    struct TestServer;
+    struct TestServer(Transport);
+    impl WithTransport for TestServer {
+        fn with_transport(self, transport: Transport) -> Self {
+            Self(transport)
+        }
+    }
     impl rmcp::ServerHandler for TestServer {
         async fn call_tool(
             &self,
             mut request: CallToolRequestParams,
             context: RequestContext<RoleServer>,
         ) -> Result<CallToolResponse, ErrorData> {
-            authz::resolve(&context)?.authorize_tool_call(&mut request)?;
+            authz::resolve(self.0, &context)?.authorize_tool_call(&mut request)?;
             let account = request
                 .arguments
                 .as_ref()
@@ -279,7 +293,7 @@ mod http_tests {
 
     fn test_router(secret: &str, hosts: Vec<String>) -> axum::Router {
         http_router(
-            TestServer,
+            TestServer(Transport::Stdio),
             &AuthConfig {
                 secret: Some(secret.into()),
             },
@@ -452,7 +466,19 @@ mod http_tests {
         let open = test_router("", vec![]);
         let cases: Vec<(Vec<(&str, &str)>, StatusCode)> = vec![
             (vec![], StatusCode::OK),
-            (vec![("x-forwarded-proto", "https")], StatusCode::OK),
+            (
+                vec![("x-forwarded-proto", "https")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![("X-Forwarded-Host", "mail.example.com")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (vec![("Via", "1.1 proxy")], StatusCode::UNAUTHORIZED),
+            (
+                vec![("CF-Connecting-IP", "198.51.100.7")],
+                StatusCode::UNAUTHORIZED,
+            ),
             (
                 vec![("Forwarded", "for=198.51.100.7")],
                 StatusCode::UNAUTHORIZED,
