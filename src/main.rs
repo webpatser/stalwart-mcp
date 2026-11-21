@@ -1,64 +1,12 @@
-use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use clap::Parser;
+use std::io::Write;
 use tracing_subscriber::EnvFilter;
 
-use stalwart_mcp::config::AppConfig;
+use stalwart_mcp::cli::{Cli, Commands, JmapVerifier, TerminalPrompter, TokenAction};
+use stalwart_mcp::config::{AppConfig, resolve_config_path};
 use stalwart_mcp::jmap::AccountManager;
 use stalwart_mcp::mcp::StalwartMcp;
 use stalwart_mcp::mcp::authz::{Transport, WithTransport};
-
-#[derive(Parser)]
-#[command(
-    name = "stalwart-mcp",
-    version,
-    about = "MCP server for Stalwart Mail Server"
-)]
-struct Cli {
-    /// Path to config file (default: ~/.config/stalwart-mcp/config.toml)
-    #[arg(short, long, global = true)]
-    config: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Start the MCP server
-    Serve {
-        /// Use stdio transport (for Claude Desktop / Cursor)
-        #[arg(long, default_value_t = true, conflicts_with = "bind")]
-        stdio: bool,
-
-        /// Bind address for HTTP transport (e.g. 127.0.0.1:3000)
-        #[arg(long)]
-        bind: Option<String>,
-    },
-
-    /// Manage JWT tokens for HTTP authentication
-    Token {
-        #[command(subcommand)]
-        action: TokenAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum TokenAction {
-    /// Create a new JWT token
-    Create {
-        /// Account name to authorize (or "*" for all accounts)
-        #[arg(long, default_value = "*")]
-        account: String,
-
-        /// Comma-separated scopes: mail:read, mail:modify, mail:send, or * for all
-        #[arg(long, default_value = "mail:read")]
-        scopes: String,
-
-        /// Token expiry in days
-        #[arg(long, default_value = "365")]
-        expires: u64,
-    },
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -72,9 +20,32 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    // `account` creates and edits the config, so it runs without loading it.
+    let command = match cli.command {
+        Commands::Account { action } => {
+            let path = resolve_config_path(cli.config.as_ref());
+            let mut stdout = std::io::stdout();
+            let all_ok = stalwart_mcp::cli::account::run(
+                action,
+                &path,
+                &mut TerminalPrompter::new(),
+                &JmapVerifier,
+                &mut stdout,
+            )
+            .await?;
+            stdout.flush()?;
+            if !all_ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        other => other,
+    };
+
     let config = AppConfig::load(cli.config.as_ref())?;
 
-    match cli.command {
+    match command {
+        Commands::Account { .. } => {}
         Commands::Serve { stdio: _, bind } => {
             // Fail fast, before connecting accounts or binding the HTTP listener
             config.validate(bind.is_some())?;

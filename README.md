@@ -345,9 +345,36 @@ stalwart-mcp token create           Generate a JWT token
     --scopes <SCOPES>               Comma-separated: mail:read,mail:modify,mail:send or * (default: mail:read)
     --expires <DAYS>                Token expiry in days (default: 365)
 
+stalwart-mcp account add            Add an account (checks the credentials first)
+    --name <NAME>                   Account name: letters, digits, - and _, at most 64
+    --url <URL>                     JMAP server URL, e.g. https://mail.example.com
+    --username <USER>               Login username
+    --default                       Make it the default account (the first account always is)
+    --password-source <SOURCE>      env or command (1password and keychain: not available yet)
+    --password-env <VAR>            Environment variable holding the password (source env)
+    --password-command <ARG>        Program and arguments that print the password, one flag
+                                    per argument (source command); the program is stored
+                                    as an absolute path
+    --no-verify                     Write without checking the credentials
+    -y, --yes                       Do not ask for confirmation
+
+stalwart-mcp account list           Name, URL, username, password source, default marker
+    --json                          Stable machine-readable output
+
+stalwart-mcp account edit <NAME>    Change only the given values; same flags as add, plus
+    --rename <NAME>                 New name (the default account follows a rename)
+
+stalwart-mcp account remove <NAME>  Remove an account; a removed default moves to the
+    -y, --yes                       first remaining account
+
+stalwart-mcp account test [NAME]    Connect one or all accounts, print ok or the error;
+                                    exits non-zero when any account fails
+
 Global options:
     -c, --config <PATH>             Path to config file
 ```
+
+The `account` commands need no existing config: `account add` creates the file (mode 0600, directory 0700) and keeps comments and unknown keys when it edits one. A value missing from the flags is asked for when stdin is a terminal; otherwise the error names the flag, and confirmations need `--yes`. `add` and `edit` check the credentials against the server before anything is written (when the URL, username or password source changes), then write the config and read the password from the stored source once more as a final check. Passwords are never shown, and `list` shows only the program name of a password command, not its arguments.
 
 ## Development
 
