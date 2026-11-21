@@ -5,6 +5,7 @@
 ### Added
 - Sieve filter tools (JMAP `SieveScript`, RFC 9661): `sieve_list`, `sieve_get` (source downloaded from the script's blob) and `sieve_validate` (server-side compile, nothing stored), scope `mail:read`.
 - `sieve_put` creates a script or replaces one by `id`, scope `mail:send` because a script can redirect mail. Behind the new `capabilities.sieve` (default false), checked before any request reaches the mail server, as is the 64 KiB script size cap. The script is always validated first, is stored inactive unless `activate: true`, and the reserved name `vacation` is refused.
+- `contacts_search` (JMAP `ContactCard/query`, `ContactCard/get` and `AddressBook/get`, RFC 9610), scope `mail:read`, read-only: searches the account's contacts by text (the server matches whole words in name, email, organisation and other card fields) and returns per contact only the name, email addresses, organisations and address book names. Only `id`, `name`, `emails`, `organizations` and `addressBookIds` are requested from the server. Default 20 results, at most 50. Fails with a clear error when the session lacks `urn:ietf:params:jmap:contacts`.
 - Blob upload and download for the raw JMAP client; the session URLs must stay on the API URL's origin and redirects are not followed.
 
 ## [1.1.1-3] - 2026-11-21

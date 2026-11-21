@@ -55,7 +55,8 @@ impl StalwartMcp {
             transport,
             tool_router: Self::create_tool_router()
                 + Self::create_account_tool_router()
-                + Self::create_sieve_tool_router(),
+                + Self::create_sieve_tool_router()
+                + Self::create_contacts_tool_router(),
             prompt_router: Self::create_prompt_router(),
         }
     }

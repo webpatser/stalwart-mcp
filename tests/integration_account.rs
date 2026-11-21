@@ -12,7 +12,10 @@
 //!   create is destroyed again;
 //! - sieve: one inactive script with a unique name is created, read back and
 //!   destroyed. Nothing is ever activated, and the script list and the active
-//!   script are asserted equal to before.
+//!   script are asserted equal to before;
+//! - contacts: one search is read-only; the roundtrip creates one made-up
+//!   card in an existing address book, finds it, destroys it and asserts the
+//!   card count equals the count before.
 //!
 //! Output holds counts and redacted response shapes only, no addresses.
 //!
@@ -24,6 +27,7 @@ use stalwart_mcp::error::AppError;
 use stalwart_mcp::jmap::JmapClient;
 use stalwart_mcp::jmap::account::VacationResponse;
 use stalwart_mcp::jmap::masked_email::NewMaskedEmail;
+use stalwart_mcp::jmap::raw::{SetResponse, parse_args};
 use stalwart_mcp::jmap::sieve::SievePut;
 
 fn test_config() -> Option<AccountConfig> {
@@ -596,4 +600,224 @@ async fn test_quota_and_identities() {
         "Identity/get returned no identities; mail_send needs one"
     );
     assert!(identities.iter().all(|i| i.email.contains('@')));
+}
+
+/// Read-only. Prints counts only, never a name or an address.
+#[tokio::test]
+#[ignore = "requires running Stalwart instance"]
+async fn test_contacts_search_read_only() {
+    let Some(client) = connect().await else {
+        return;
+    };
+    if !client.has_contacts() {
+        let err = client
+            .search_contacts(None, 5)
+            .await
+            .expect_err("search without the capability must fail");
+        assert!(
+            err.to_string().contains("urn:ietf:params:jmap:contacts"),
+            "unclear error: {err}"
+        );
+        eprintln!("contacts: capability absent, clear error returned");
+        return;
+    }
+    let books = ok("AddressBook/get", client.address_books().await);
+    eprintln!("address books: {}", books.len());
+
+    let contacts = ok("ContactCard/query", client.search_contacts(None, 5).await);
+    eprintln!("cards returned (limit 5): {}", contacts.len());
+    assert!(contacts.len() <= 5);
+    for contact in &contacts {
+        let shape = serde_json::to_value(contact).expect("json");
+        let keys: Vec<&str> = shape
+            .as_object()
+            .map(|o| o.keys().map(String::as_str).collect())
+            .unwrap_or_default();
+        assert_eq!(keys.len(), 4, "unexpected fields: {keys:?}");
+        assert!(contact.emails.iter().all(|e| e.contains('@')));
+    }
+    let with_email = contacts.iter().filter(|c| !c.emails.is_empty()).count();
+    let with_name = contacts.iter().filter(|c| c.name.is_some()).count();
+    eprintln!("cards with a name: {with_name}, with an email: {with_email}");
+
+    let none = ok(
+        "ContactCard/query (text)",
+        client.search_contacts(Some("zzqxnomatch"), 5).await,
+    );
+    eprintln!("cards for a nonsense query: {}", none.len());
+    assert!(none.is_empty());
+}
+
+const CONTACTS_CAPABILITY: &str = "urn:ietf:params:jmap:contacts";
+const CARD_SET: &str = "ContactCard/set";
+
+/// Total number of cards in the account (`calculateTotal`).
+async fn card_count(client: &JmapClient) -> Result<u64, String> {
+    let raw = client.raw().map_err(|e| e.to_string())?;
+    let response = raw
+        .call(
+            &[CONTACTS_CAPABILITY],
+            "ContactCard/query",
+            json!({"accountId": raw.account_id(), "calculateTotal": true, "limit": 1}),
+        )
+        .await
+        .map_err(|e| format!("ContactCard/query (total) failed: {e}"))?;
+    response
+        .get("total")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "ContactCard/query returned no total".to_string())
+}
+
+/// Lowercase letters only, so the server's tokenizer keeps it one word.
+fn letters_token() -> String {
+    let mut n = nanos();
+    let mut token = String::from("zzmcp");
+    while n > 0 {
+        token.push(char::from(b'a' + (n % 26) as u8));
+        n /= 26;
+    }
+    token
+}
+
+/// Self-restoring: creates one made-up card, finds it through the code path
+/// `contacts_search` uses, destroys it and asserts the card count is back.
+/// Prints counts and the redacted shape of its own made-up card only.
+#[tokio::test]
+#[ignore = "requires running Stalwart instance"]
+async fn test_contacts_card_roundtrip() {
+    let Some(client) = connect().await else {
+        return;
+    };
+    if !client.has_contacts() {
+        eprintln!("contacts: capability absent, roundtrip skipped");
+        return;
+    }
+    let books = ok("AddressBook/get", client.address_books().await);
+    let Some(book_id) = books.keys().min().cloned() else {
+        eprintln!("contacts: no address book, roundtrip skipped");
+        return;
+    };
+    let before = match card_count(&client).await {
+        Ok(n) => n,
+        Err(e) => panic!("{e}"),
+    };
+    eprintln!("address books: {}, cards before: {before}", books.len());
+
+    let token = letters_token();
+    let full = format!("Zz Mcp Test {token}");
+    let email = format!("{token}@example.org");
+    let org = "Zz Mcp Test Org";
+    let raw = ok("raw client", client.raw());
+    let response = ok(
+        CARD_SET,
+        raw.call(
+            &[CONTACTS_CAPABILITY],
+            CARD_SET,
+            json!({"accountId": raw.account_id(), "create": {"k0": {
+                "@type": "Card",
+                "addressBookIds": {book_id.as_str(): true},
+                "name": {"@type": "Name", "full": full},
+                "emails": {"e1": {"@type": "EmailAddress", "address": email}},
+                "organizations": {"o1": {"@type": "Organization", "name": org}}
+            }}}),
+        )
+        .await,
+    );
+    let mut set: SetResponse = ok(CARD_SET, parse_args(CARD_SET, response));
+    let created = ok(CARD_SET, set.created_one(CARD_SET, "k0"));
+    let id = created["id"].as_str().unwrap_or_default().to_string();
+    eprintln!("created one test card");
+
+    let outcome = contacts_steps(&client, &id, &token, &full, &email, org).await;
+    let cleaned = contacts_cleanup(&client, &id).await;
+    if let Err(e) = &outcome {
+        eprintln!("contacts roundtrip failed: {e}");
+    }
+    if let Err(e) = &cleaned {
+        eprintln!("!!!!! {e} !!!!!");
+    }
+    outcome.expect("contacts roundtrip");
+    cleaned.expect("contacts cleanup");
+
+    let after = match card_count(&client).await {
+        Ok(n) => n,
+        Err(e) => panic!("{e}"),
+    };
+    eprintln!("cards after: {after}");
+    assert_eq!(after, before, "card count differs from before the test");
+}
+
+async fn contacts_steps(
+    client: &JmapClient,
+    id: &str,
+    token: &str,
+    full: &str,
+    email: &str,
+    org: &str,
+) -> Result<(), String> {
+    print_raw_shape(
+        client,
+        CONTACTS_CAPABILITY,
+        "ContactCard/get",
+        json!({"ids": [id], "properties": stalwart_mcp::jmap::contacts::CARD_PROPERTIES}),
+    )
+    .await;
+    // The server indexes cards in the background; poll for up to 15 s.
+    let mut found = Vec::new();
+    for attempt in 1..=30 {
+        found = client
+            .search_contacts(Some(token), 5)
+            .await
+            .map_err(|e| format!("search failed: {e}"))?;
+        if !found.is_empty() {
+            eprintln!(
+                "search found {} card(s) after {attempt} attempt(s)",
+                found.len()
+            );
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    let [card] = found.as_slice() else {
+        return Err(format!(
+            "expected one card for the token, got {}",
+            found.len()
+        ));
+    };
+    let mut problems = Vec::new();
+    if card.name.as_deref() != Some(full) {
+        problems.push("name");
+    }
+    if card.emails != [email] {
+        problems.push("emails");
+    }
+    if card.organizations != [org] {
+        problems.push("organizations");
+    }
+    if card.address_books.len() != 1 {
+        problems.push("addressBooks");
+    }
+    if problems.is_empty() {
+        eprintln!("name, email, organisation and address book extracted");
+        Ok(())
+    } else {
+        Err(format!("wrong extraction of: {problems:?}"))
+    }
+}
+
+async fn contacts_cleanup(client: &JmapClient, id: &str) -> Result<(), String> {
+    let raw = client.raw().map_err(|e| e.to_string())?;
+    let response = raw
+        .call(
+            &[CONTACTS_CAPABILITY],
+            CARD_SET,
+            json!({"accountId": raw.account_id(), "destroy": [id]}),
+        )
+        .await
+        .map_err(|e| format!("could not destroy test card {id}: {e}"))?;
+    let set: SetResponse = parse_args(CARD_SET, response).map_err(|e| e.to_string())?;
+    set.destroyed_one(CARD_SET, id)
+        .map_err(|e| format!("could not destroy test card {id}: {e}"))?;
+    eprintln!("destroyed the test card");
+    Ok(())
 }

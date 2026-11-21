@@ -43,6 +43,9 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `sieve_get` | One Sieve script with its source, downloaded from its blob |
 | `sieve_validate` | Compile a Sieve script on the server without storing it; returns `valid` and the server's error. At most 64 KiB |
 | `sieve_put` | Create a Sieve script or replace the source of one by `id`. A wrong script can discard or redirect incoming mail. The script is always validated first and refused if it does not compile; it is stored inactive unless `activate: true`. The name `vacation` is reserved for the vacation response. At most 64 KiB (requires `capabilities.sieve = true`) |
+| `contacts_search` | Search contacts by text (`ContactCard/query`, RFC 9610; the server matches whole words in name, email, organisation and other card fields), or list them when `query` is omitted. Returns only name, email addresses, organisations and address book names; nothing else is requested from the server. Default 20, at most 50 results. Needs `urn:ietf:params:jmap:contacts` in the session |
+
+`contacts_search` was verified live against Stalwart 1.1.1: a live test creates one made-up card, finds it by text search, checks that name, email address, organisation and address book are extracted, then destroys it and asserts the card count is unchanged.
 
 Every tool takes an optional `account` argument; omit it for the default account.
 
@@ -240,7 +243,7 @@ Scopes and `--account` are enforced on every tool call and resource read. A toke
 
 | Scope | Tools |
 |-------|-------|
-| `mail:read` | `mail_list_folders`, `mail_list_recent`, `mail_search`, `mail_get`, `mail_masked_list`, `mail_vacation_get`, `quota_get`, `identity_list`, `sieve_list`, `sieve_get`, `sieve_validate` |
+| `mail:read` | `mail_list_folders`, `mail_list_recent`, `mail_search`, `mail_get`, `mail_masked_list`, `mail_vacation_get`, `quota_get`, `identity_list`, `sieve_list`, `sieve_get`, `sieve_validate`, `contacts_search` |
 | `mail:modify` | `mail_flag`, `mail_move`, `mail_draft`, `mail_bulk_read`, `mail_bulk_junk`, `mail_bulk_delete`, `mail_masked_create`, `mail_masked_disable`, `spam_train` |
 | `mail:send` | `mail_send`, `mail_vacation_set` (an enabled vacation response makes the server send auto-replies), `sieve_put` (a script can redirect mail) |
 

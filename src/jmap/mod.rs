@@ -1,4 +1,5 @@
 pub mod account;
+pub mod contacts;
 pub mod mail;
 pub mod masked_email;
 pub mod raw;

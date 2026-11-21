@@ -52,6 +52,7 @@ pub const TOOL_SCOPES: &[(&str, Scope)] = &[
     ("sieve_list", Scope::Read),
     ("sieve_get", Scope::Read),
     ("sieve_validate", Scope::Read),
+    ("contacts_search", Scope::Read),
     ("mail_flag", Scope::Modify),
     ("mail_move", Scope::Modify),
     ("mail_draft", Scope::Modify),
@@ -332,7 +333,8 @@ mod tests {
     fn every_router_tool_has_a_scope_and_an_account_property() {
         let router = StalwartMcp::create_tool_router()
             + StalwartMcp::create_account_tool_router()
-            + StalwartMcp::create_sieve_tool_router();
+            + StalwartMcp::create_sieve_tool_router()
+            + StalwartMcp::create_contacts_tool_router();
         let tools = router.list_all();
         assert!(!tools.is_empty());
         for tool in &tools {

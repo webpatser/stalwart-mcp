@@ -72,6 +72,7 @@ impl RateLimiters {
         limiters.insert("sieve_get", TokenBucket::new(30));
         limiters.insert("sieve_validate", TokenBucket::new(10));
         limiters.insert("sieve_put", TokenBucket::new(5));
+        limiters.insert("contacts_search", TokenBucket::new(30));
 
         Self {
             limiters: Mutex::new(limiters),
