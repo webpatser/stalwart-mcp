@@ -266,28 +266,59 @@ def tool_result(r):
 
 # ---------------------------------------------------------------- direct JMAP
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """Never follow a redirect, so the Basic credential is never sent to its target."""
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def origin(url):
+    """(scheme, host, effective port) of `url`, lowercased; None if not http(s) or malformed."""
+    try:
+        p = urllib.parse.urlsplit(url)
+        port = p.port
+    except ValueError:
+        return None
+    scheme = (p.scheme or "").lower()
+    host = (p.hostname or "").lower()
+    if scheme not in _DEFAULT_PORTS or not host:
+        return None
+    return scheme, host, port if port is not None else _DEFAULT_PORTS[scheme]
+
+
+def same_origin(a, b):
+    """True only when both URLs have the same scheme, host and effective port."""
+    oa = origin(a)
+    return oa is not None and oa == origin(b)
+
+
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only within the origin of `base` (at most 3 hops), so the
+    Basic credential never reaches another scheme, host or port."""
+
+    max_redirections = 3
+
+    def __init__(self, base):
+        super().__init__()
+        self.base = base
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+        if not same_origin(self.base, newurl):
+            fp.close()
+            raise RuntimeError(
+                f"JMAP request redirected ({code}) to another origin; refusing to follow")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirect)
-
-
-def _open_no_redirect(req):
-    """Open `req` without following redirects; any 3xx is a failure."""
+def _open_jmap(opener, req):
+    """Open `req`; an unfollowed or exhausted redirect is a failure."""
     try:
-        r = _NO_REDIRECT_OPENER.open(req, timeout=30)
+        r = opener.open(req, timeout=30)
     except urllib.error.HTTPError as e:
         if 300 <= e.code < 400:
             e.close()
-            raise RuntimeError(f"JMAP request redirected ({e.code}); refusing to follow") from None
+            raise RuntimeError(f"JMAP request redirected ({e.code}); not followed") from None
         raise
     if 300 <= r.status < 400:
         r.close()
-        raise RuntimeError(f"JMAP request redirected ({r.status}); refusing to follow")
+        raise RuntimeError(f"JMAP request redirected ({r.status}); not followed")
     return r
 
 
@@ -295,16 +326,20 @@ class Jmap:
     """Minimal JMAP caller for cleanup steps that have no (enabled) MCP tool."""
 
     def __init__(self, account_id):
-        url = os.environ["STALWART_TEST_URL"].rstrip("/")
+        base = os.environ["STALWART_TEST_URL"]
+        url = base.rstrip("/")
         if not url.endswith("/.well-known/jmap"):
             url += "/.well-known/jmap"
+        if origin(url) is None:
+            raise RuntimeError("STALWART_TEST_URL is not an http(s) URL")
         self.host = urllib.parse.urlparse(url).hostname
+        self.opener = urllib.request.build_opener(_SameOriginRedirect(url))
         cred = f'{os.environ["STALWART_TEST_USER"]}:{os.environ["STALWART_PASSWORD"]}'
         self.auth = "Basic " + base64.b64encode(cred.encode()).decode()
         req = urllib.request.Request(url, headers={"Authorization": self.auth})
-        with _open_no_redirect(req) as r:
-            if urllib.parse.urlparse(r.geturl()).hostname != self.host:
-                raise RuntimeError("session redirected to another host")
+        with _open_jmap(self.opener, req) as r:
+            if not same_origin(url, r.geturl()):
+                raise RuntimeError("session redirected to another origin")
             session = json.load(r)
         self.api = session["apiUrl"]
         if urllib.parse.urlparse(self.api).hostname != self.host:
@@ -318,7 +353,7 @@ class Jmap:
         }).encode()
         req = urllib.request.Request(self.api, data=body, method="POST", headers={
             "Authorization": self.auth, "Content-Type": "application/json"})
-        with _open_no_redirect(req) as r:
+        with _open_jmap(self.opener, req) as r:
             resp = json.load(r)
         name, out, _ = resp["methodResponses"][0]
         if name == "error":
@@ -527,16 +562,21 @@ def draft_flow(s, ctx, jm):
     finally:
         # Permanent delete is gated off in this config, so remove the draft over
         # JMAP directly, and only if it is still the one this run created.
-        subj = jm.email_subject(did)
-        if subj is None:
-            cleanup(f"draft {did}: already gone")
-        elif subj != subject:
-            check("C", "draft cleanup", False, f"{did} is not ours, not touched")
-        else:
-            destroyed = jm.email_destroy(did)
-            gone = jm.email_subject(did) is None
-            cleanup(f"draft {did}: destroyed={destroyed} gone={gone}")
-            check("C", "draft destroyed", destroyed and gone, "")
+        try:
+            subj = jm.email_subject(did)
+            if subj is None:
+                cleanup(f"draft {did}: already gone")
+            elif subj != subject:
+                check("C", "draft cleanup", False, f"{did} is not ours, not touched")
+            else:
+                destroyed = jm.email_destroy(did)
+                gone = jm.email_subject(did) is None
+                cleanup(f"draft {did}: destroyed={destroyed} gone={gone}")
+                check("C", "draft destroyed", destroyed and gone, "")
+        except Exception as e:  # noqa: BLE001
+            cleanup(f"draft {did}: FAILED ({type(e).__name__}: {e}); "
+                    f"left behind, subject '{subject}'")
+            check("C", "draft destroyed", False, "cleanup raised")
 
 
 def masked_flow(s, ctx, jm):
@@ -562,20 +602,25 @@ def masked_flow(s, ctx, jm):
         check("C", "masked listed disabled", ours is not None and ours.get("enable") is False,
               f"enable={ours and ours.get('enable')}")
     finally:
-        m = jm.masked_get(mid)
-        if m is None:
-            cleanup(f"masked {mid}: already gone")
-        elif m.get("description") != desc:
-            check("C", "masked cleanup", False, f"{mid} is not ours, not touched")
-        else:
-            destroyed = jm.masked_destroy(mid)
-            gone = jm.masked_get(mid) is None
-            lst = s.call_json("mail_masked_list")
-            cleanup(f"masked {mid}: destroyed={destroyed} gone={gone}")
-            check("C", "masked destroyed, count restored",
-                  destroyed and gone and len(lst) == before
-                  and all(x["id"] != mid for x in lst),
-                  f"destroyed={destroyed} gone={gone} count={len(lst)} before={before}")
+        try:
+            m = jm.masked_get(mid)
+            if m is None:
+                cleanup(f"masked {mid}: already gone")
+            elif m.get("description") != desc:
+                check("C", "masked cleanup", False, f"{mid} is not ours, not touched")
+            else:
+                destroyed = jm.masked_destroy(mid)
+                gone = jm.masked_get(mid) is None
+                cleanup(f"masked {mid}: destroyed={destroyed} gone={gone}")
+                lst = s.call_json("mail_masked_list")
+                check("C", "masked destroyed, count restored",
+                      destroyed and gone and len(lst) == before
+                      and all(x["id"] != mid for x in lst),
+                      f"destroyed={destroyed} gone={gone} count={len(lst)} before={before}")
+        except Exception as e:  # noqa: BLE001
+            cleanup(f"masked {mid}: FAILED ({type(e).__name__}: {e}); "
+                    f"left behind, description '{desc}'")
+            check("C", "masked destroyed, count restored", False, "cleanup raised")
 
 
 _S = {}
@@ -642,25 +687,35 @@ def vacation_flow(s, ctx, jm):
         check("C", "mail_vacation_set disabled test state", good,
               "read back equal" if good else f"{text[:120]} back_keys={sorted(back)}")
     finally:
-        restore(prior, s)
-        after = s.call_json("mail_vacation_get")
-        cleanup(f"vacation response restored: equal={after == prior}")
-        check("C", "vacation restored", after == prior, f"equal={after == prior}")
-        now_scripts = jm.sieve_scripts()
-        before_ids = {x[0] for x in sieve_before}
-        added = [x for x in now_scripts if x[0] not in before_ids]
-        for sid, name, active in added:
-            if name == "vacation" and not active:
-                out = jm.call(["urn:ietf:params:jmap:sieve"], "SieveScript/set", {"destroy": [sid]})
-                cleanup(f"inactive 'vacation' sieve script {sid}: "
-                        f"destroyed={sid in (out.get('destroyed') or [])}")
-            else:
-                check("C", "unexpected sieve script", False, f"name={name} active={active}")
-        final = jm.sieve_scripts()
-        check("C", "sieve list as before", final == sieve_before,
-              f"{len(final)} scripts (before {len(sieve_before)}), added_by_write={len(added)}")
-        again = s.call_json("mail_vacation_get")
-        check("C", "vacation still equal after sieve cleanup", again == prior, "")
+        try:
+            _vacation_cleanup(s, jm, prior, sieve_before)
+        except Exception as e:  # noqa: BLE001
+            cleanup(f"vacation/sieve: FAILED ({type(e).__name__}: {e}); "
+                    f"check the vacation response (subject 'stalwart-mcp e2e {TS}') "
+                    "and any inactive 'vacation' sieve script")
+            check("C", "vacation restored", False, "cleanup raised")
+
+
+def _vacation_cleanup(s, jm, prior, sieve_before):
+    restore(prior, s)
+    after = s.call_json("mail_vacation_get")
+    cleanup(f"vacation response restored: equal={after == prior}")
+    check("C", "vacation restored", after == prior, f"equal={after == prior}")
+    now_scripts = jm.sieve_scripts()
+    before_ids = {x[0] for x in sieve_before}
+    added = [x for x in now_scripts if x[0] not in before_ids]
+    for sid, name, active in added:
+        if name == "vacation" and not active:
+            out = jm.call(["urn:ietf:params:jmap:sieve"], "SieveScript/set", {"destroy": [sid]})
+            cleanup(f"inactive 'vacation' sieve script {sid}: "
+                    f"destroyed={sid in (out.get('destroyed') or [])}")
+        else:
+            check("C", "unexpected sieve script", False, f"name={name} active={active}")
+    final = jm.sieve_scripts()
+    check("C", "sieve list as before", final == sieve_before,
+          f"{len(final)} scripts (before {len(sieve_before)}), added_by_write={len(added)}")
+    again = s.call_json("mail_vacation_get")
+    check("C", "vacation still equal after sieve cleanup", again == prior, "")
 
 
 def send_flow(s, ctx, send):
@@ -990,8 +1045,7 @@ def leftovers(s, ctx, jm):
 
 # ---------------------------------------------------------------- main
 
-def run(args):
-    ctx = {"sent": 0}
+def run(args, ctx):
     cfg = write_config(work("config.toml"), send=True, masked=True, vacation=True)
     s = Stdio(cfg, "stdio-main")
     _S["main"] = s
@@ -1001,14 +1055,26 @@ def run(args):
                 fn()
             except Exception as e:  # noqa: BLE001
                 check(label, "section aborted", False, f"{type(e).__name__}: {e}")
-        jm = Jmap(ctx["account_id"])
-        for name, fn in [
-            ("draft", lambda: draft_flow(s, ctx, jm)),
-            ("masked", lambda: masked_flow(s, ctx, jm)),
-            ("vacation", lambda: vacation_flow(s, ctx, jm)),
+        # Every write flow cleans up over direct JMAP, so without a working JMAP
+        # session nothing is created at all.
+        jm = None
+        try:
+            jm = Jmap(ctx["account_id"])
+            check("C", "direct JMAP session", True, "")
+        except Exception as e:  # noqa: BLE001
+            check("C", "direct JMAP session", False,
+                  f"{type(e).__name__}: {e}; draft, masked and vacation writes skipped")
+        flows = [
             ("send", lambda: send_flow(s, ctx, args.send)),
             ("gating", lambda: gating_flow(ctx)),
-        ]:
+        ]
+        if jm is not None:
+            flows = [
+                ("draft", lambda: draft_flow(s, ctx, jm)),
+                ("masked", lambda: masked_flow(s, ctx, jm)),
+                ("vacation", lambda: vacation_flow(s, ctx, jm)),
+            ] + flows
+        for name, fn in flows:
             try:
                 fn()
             except Exception as e:  # noqa: BLE001
@@ -1052,7 +1118,9 @@ def main():
     info(f"run {TS}, version {VERSION}, send={args.send}")
     ctx = {"sent": 0}
     try:
-        ctx = run(args)
+        run(args, ctx)
+    except BaseException as e:  # noqa: BLE001 - always clean up and print the summary
+        check("Z", "run aborted", False, f"{type(e).__name__}: {e}")
     finally:
         if args.keep_logs:
             info(f"logs kept in {WORKDIR}")

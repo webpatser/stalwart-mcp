@@ -9,7 +9,7 @@
 - `token create` rejects unknown scope strings; accepted are `mail:read`, `mail:modify`, `mail:send` and `*`.
 - **Behaviour change:** `mail_bulk_delete` no longer destroys mail by default (#4). It now moves the emails to the Trash mailbox (resolved by its `trash` role, else a folder named "Trash") and reports how many the server actually moved; without a Trash mailbox it fails and deletes nothing. Permanent destruction needs the new `permanent: true` argument and the new `capabilities.delete = true` (default false); the capability is checked before any request reaches the mail server.
 - Without `auth.secret`, a loopback HTTP request that carries any of `Forwarded`, `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`, `X-Forwarded-Port`, `Via`, `CF-Connecting-IP`, `True-Client-IP` or `X-Client-IP` (any value, any casing) is now rejected with 401 and a warning naming `auth.secret`: a request a reverse proxy forwarded is not a local client. A proxy that adds none of those headers is still trusted, so set `auth.secret` behind any proxy.
-- `scripts/e2e.py` never follows a redirect on its direct JMAP calls, so the Basic credential is never sent to a redirect target; any 3xx fails the run.
+- `scripts/e2e.py` follows a redirect on its direct JMAP calls only to the same scheme, host and port as the configured server, so the Basic credential is never sent to another origin; any other redirect fails the run.
 
 ### Fixed
 - Resource update notifications now name `mail://{account}/folders`, the declared resource, instead of `stalwart://inbox/{account}`, which matched nothing a client could subscribe to.

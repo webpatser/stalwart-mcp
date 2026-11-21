@@ -4,5 +4,6 @@
 .env
 .mcp.json
 .DS_Store
+__pycache__/
 docs/
 CLAUDE.md
