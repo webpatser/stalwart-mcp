@@ -5,3 +5,4 @@ pub mod jmap;
 pub mod mcp;
 pub mod notifications;
 pub mod rate_limit;
+pub mod secret;

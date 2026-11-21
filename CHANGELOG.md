@@ -1,9 +1,19 @@
 # Changelog
 
-## [Unreleased]
+## [1.1.1-5] - Unreleased
+
+### Added
+- Per-account `password_command`: an argv array run without a shell whose stdout is the password (stdin closed, at most 4 KiB, one trailing newline stripped, killed after 60 s). A failure names the account and carries the exit status plus at most the first stderr line, never the output. Use it or `password_env`, not both; with neither, `STALWART_PASSWORD` is read as before.
+- The config is validated at load: duplicate account names, an empty `name`, `url` or `username`, an empty `password_command`, and a `default_account` that names no configured account are errors.
 
 ### Changed
+- All accounts connect concurrently at startup, so a slow password command does not delay the others. A failing account is still skipped with a warning. Without a usable `default_account` the first connected account in config order is the default.
 - README: new "Connecting a client" section replaces the scattered client snippets (Claude Code, Claude Desktop, other stdio clients, HTTP with tokens); the examples no longer put the password in a client config file.
+
+### Security
+- `accounts` can no longer be set or replaced through `STALWART_MCP_*` environment variables; they come from the config file only. Other overrides keep working.
+- On Unix a config containing a `password_command` is refused unless the file is owned by the current user and neither the file nor its directory is writable by group or others; the error names the fix (`chmod 600`). The check runs on the handle the file was read from. Not checked on Windows.
+- Passwords are held in a type whose `Debug` output is redacted.
 
 ## [1.1.1-4] - 2026-11-21
 

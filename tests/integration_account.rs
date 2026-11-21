@@ -37,7 +37,8 @@ fn test_config() -> Option<AccountConfig> {
         name: "test".to_string(),
         url,
         username,
-        password_env: "STALWART_PASSWORD".to_string(),
+        password_env: Some("STALWART_PASSWORD".to_string()),
+        password_command: None,
     })
 }
 

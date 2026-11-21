@@ -9,6 +9,7 @@ pub mod thread;
 
 use crate::config::AccountConfig;
 use crate::error::AppError;
+use crate::secret::Secret;
 use jmap_client::client::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap};
 use reqwest::redirect::Policy;
@@ -49,9 +50,19 @@ pub(crate) fn api_http_client(headers: HeaderMap) -> Result<reqwest::Client, App
 }
 
 impl JmapClient {
+    /// Resolve the account's password (environment variable or
+    /// `password_command`) and connect.
     pub async fn connect(config: &AccountConfig) -> Result<Self, AppError> {
-        let password = config.password()?;
+        let password = config.resolve_password().await?;
+        Self::connect_with_password(config, &password).await
+    }
 
+    /// Connect with a password the caller already holds (for example one typed
+    /// in by `account add`, verified before it is stored anywhere).
+    pub async fn connect_with_password(
+        config: &AccountConfig,
+        password: &Secret,
+    ) -> Result<Self, AppError> {
         let url_parsed = url::Url::parse(&config.url)
             .map_err(|e| AppError::JmapConnection(format!("Invalid URL: {e}")))?;
         let host = url_parsed
@@ -60,7 +71,7 @@ impl JmapClient {
             .to_string();
 
         let client = Client::new()
-            .credentials((config.username.as_str(), password.as_str()))
+            .credentials((config.username.as_str(), password.expose()))
             .follow_redirects([host])
             .connect(&config.url)
             .await
@@ -220,10 +231,21 @@ impl AccountManager {
             return Err(AppError::Config("No accounts configured".into()));
         }
 
+        // Concurrently, so slow password commands (a Touch ID prompt) and slow
+        // servers do not add up across accounts.
+        let results = futures::future::join_all(
+            configs
+                .iter()
+                .map(|config| async move { (config, JmapClient::connect(config).await) }),
+        )
+        .await;
+
         let mut accounts = HashMap::new();
-        for config in configs {
-            match JmapClient::connect(config).await {
+        let mut first_connected = None;
+        for (config, result) in results {
+            match result {
                 Ok(client) => {
+                    first_connected.get_or_insert_with(|| config.name.clone());
                     accounts.insert(config.name.clone(), Arc::new(client));
                 }
                 Err(e) => {
@@ -236,14 +258,13 @@ impl AccountManager {
             }
         }
 
-        if accounts.is_empty() {
-            return Err(AppError::Config("No accounts could be connected".into()));
-        }
-
+        // The configured default if it connected, else the first account (in
+        // config order) that did.
         let default = default_account
+            .filter(|name| accounts.contains_key(*name))
             .map(String::from)
-            .filter(|name| accounts.contains_key(name))
-            .unwrap_or_else(|| accounts.keys().next().unwrap().clone());
+            .or(first_connected)
+            .ok_or_else(|| AppError::Config("No accounts could be connected".into()))?;
 
         Ok(Self { accounts, default })
     }

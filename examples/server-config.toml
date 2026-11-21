@@ -12,6 +12,19 @@ username = "user@example.com"
 # username = "user@work.com"
 # password_env = "STALWART_PASSWORD_WORK"
 
+# Or let a command print the password (argv array, run without a shell, stdin
+# closed, killed after 60 s; one trailing newline is stripped). Use either
+# password_env or password_command per account, not both. On Unix a config with
+# a password_command must be owned by you and not writable by group or others,
+# and so must its directory (chmod 600 on the file, chmod 700 on the directory).
+# Not checked on Windows. Accounts are only read from this file, never from
+# STALWART_MCP_* environment variables.
+# [[accounts]]
+# name = "keychain"
+# url = "https://mail.example.com"
+# username = "me@example.com"
+# password_command = ["/usr/bin/security", "find-generic-password", "-s", "stalwart-mcp", "-a", "keychain", "-w"]
+
 # Optional: first account is used as default if omitted
 # default_account = "personal"
 
