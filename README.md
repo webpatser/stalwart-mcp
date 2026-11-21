@@ -111,19 +111,21 @@ cargo install --locked --path .
 
 ## Configuration
 
-Create `~/.config/stalwart-mcp/config.toml`:
+The config lives at `~/.config/stalwart-mcp/config.toml` (or wherever `--config` points). The simplest way to create it is `stalwart-mcp account add`, see [Connecting a client](#connecting-a-client); it writes the accounts and keeps any comments and other keys you add by hand. Written by hand it looks like this:
 
 ```toml
 [[accounts]]
 name = "personal"
 url = "https://mail.example.com"
 username = "user@example.com"
-# password_env = "STALWART_PASSWORD"  # default
+# Run a command that prints the password (here: the macOS Keychain)
+password_command = ["/usr/bin/security", "find-generic-password", "-s", "stalwart-mcp", "-a", "personal", "-w"]
 
 [[accounts]]
 name = "work"
 url = "https://mail.example.com"
 username = "work@example.com"
+# Read the password from an environment variable
 password_env = "STALWART_PASSWORD_WORK"
 
 # Optional: use first account if omitted
@@ -165,7 +167,18 @@ password_env = "STALWART_PASSWORD_WORK"
 # secret = "your-secret-here"
 ```
 
-Set your password(s) as environment variables:
+### Passwords
+
+Each account takes its password from one of two keys, never both:
+
+- `password_env = "VAR"`: the password is read from that environment variable. An account with neither key reads `STALWART_PASSWORD`, as in earlier versions.
+- `password_command = ["/abs/program", "arg", ...]`: the server runs this argv at startup, without a shell, with stdin closed, and takes its stdout as the password (at most 4 KiB, one trailing newline stripped). A command that fails, prints nothing or runs longer than 60 seconds is killed and the account is skipped with a warning naming it. `account add` writes this key for the 1Password and Keychain sources; any program that prints a password works.
+
+On Unix, a config that contains a `password_command` is refused unless the file is owned by you and neither the file nor its directory is writable by group or others (`chmod 600` on the file, `chmod 700` on the directory; `account add` creates them that way). Anyone who could edit the file could otherwise make the server run their command. This is not checked on Windows.
+
+Accounts come from the config file only: `STALWART_MCP_*` environment variables can no longer set or replace `accounts` (they could in earlier versions). Other settings can still be overridden that way.
+
+For the `env` source, export the variables in the environment that starts the server:
 
 ```bash
 export STALWART_PASSWORD="your-password"
@@ -179,66 +192,63 @@ This is the one place for client setup. Stdio is the default for local use; HTTP
 ### Prerequisites
 
 - The binary is installed (`cargo install --path . --locked`, see [Installation](#installation)), by default at `~/.cargo/bin/stalwart-mcp`.
-- A config file whose accounts read the password from an environment variable (`password_env`, see [Configuration](#configuration)).
+- At least one account added with `stalwart-mcp account add` (below).
 
-### Recommended local layout
-
-Keep the password out of every client config file. The config holds no password, and a small env file exports only the password variable:
-
-```
-~/.config/stalwart-mcp/config.toml     mode 0600, accounts with password_env
-~/.config/stalwart-mcp/personal.env    mode 0600, exports only the password variable
-```
+### Add an account
 
 ```bash
-mkdir -p ~/.config/stalwart-mcp
-cat > ~/.config/stalwart-mcp/personal.env <<'ENV'
-STALWART_PASSWORD='your-password'
-ENV
-chmod 600 ~/.config/stalwart-mcp/personal.env ~/.config/stalwart-mcp/config.toml
+stalwart-mcp account add
 ```
 
-```toml
-[[accounts]]
-name = "personal"
-url = "https://mail.example.org"
-username = "you@example.org"
-# password_env defaults to STALWART_PASSWORD
+On a terminal this asks for the account name, the JMAP URL, the username and where the password comes from, with 1Password suggested when it is detected, else the macOS Keychain, else an environment variable. It checks the credentials against the server before anything is written, stores the password (1Password or Keychain), writes `~/.config/stalwart-mcp/config.toml` (mode 0600), and reads the password back from the store once more. Without a terminal every value must come from a flag, see [CLI reference](#cli-reference), for example:
+
+```bash
+printf '%s\n' "$MAIL_PASSWORD" | stalwart-mcp account add --name personal \
+  --url https://mail.example.org --username you@example.org \
+  --password-source keychain --password-stdin --yes
 ```
 
-The clients below start the server through `/bin/sh -c`, which sources the env file (`set -a` exports every variable it defines), then `exec`s the binary:
+Then `stalwart-mcp account test` connects every account and prints `ok` or the error. With a 1Password or Keychain source the config holds no password and the client needs no environment variable, so the client runs the binary directly (next sections).
 
-```sh
-set -a; . "$HOME/.config/stalwart-mcp/personal.env"; set +a; exec "$HOME/.cargo/bin/stalwart-mcp" --config "$HOME/.config/stalwart-mcp/config.toml" serve --stdio
-```
+### Password sources
+
+Each source has a trade-off; pick per account.
+
+**1Password** (`--password-source 1password`, macOS, Linux and Windows). Needs the 1Password CLI (`op`, for example `brew install 1password-cli`) with the CLI integration switched on in the 1Password app (Settings, Developer). Either reference an existing item (`--op-reference op://vault/item/password`, or pick one on the terminal from the Login items whose URL or title matches the mail host), or create a new Login item `stalwart-mcp <name>` in `--op-vault <vault>` from the password you type. The config gets `password_command = ["<absolute path of op>", "read", "-n", "--account", "<account id>", "op://<vault id>/<item id>/password"]`, by ids so a renamed item keeps working, and with absolute paths because a client started from the Dock has a minimal `PATH`. Trade-off: the password never sits in a file or in the Keychain, but 1Password asks for Touch ID (or your password) every time the server starts and the app is locked. Not yet proven: whether that prompt works when a client without a terminal (Claude Desktop, a Claude Code MCP server) starts the server, and the integration has so far only been tested against a stand-in for `op`, not a real one. If the account fails to connect from your client, switch it to the Keychain with `stalwart-mcp account edit <name> --password-source keychain`. stalwart-mcp never deletes a 1Password item, except one it created itself in the same run that then failed.
+
+**macOS Keychain** (`--password-source keychain`, macOS only). The password is stored with `/usr/bin/security` under service `stalwart-mcp` and the account name; the config gets `password_command = ["/usr/bin/security", "find-generic-password", "-s", "stalwart-mcp", "-a", "<name>", "-w"]`. Trade-off: no prompt when the server starts, but any process running as your user can read the item the same way, because the item trusts `/usr/bin/security` and anyone can run that. An existing item is only replaced with `--force`, and passwords containing a line break cannot be stored this way. `stalwart-mcp account remove <name> --delete-secret` deletes the item along with the account; `account edit <name> --rename <new>` moves it to the new name.
+
+**Environment variable** (`--password-source env`, the default with neither store available). The password is read from `password_env` (default `STALWART_PASSWORD`), so the client must start the server with that variable set; see [Fallback: environment variable](#fallback-environment-variable). Trade-off: no extra tool, but the password lives in a file you manage.
+
+**Your own command** (`--password-source command --password-command <program> --password-command <arg> ...`). Any program that prints the password, for example `pass` or, on Linux, `secret-tool lookup`; the program is stored as an absolute path.
+
+On Linux and Windows the choices are 1Password, `env` and `command`.
 
 ### Claude Code
 
-**Project scope**: add to `.mcp.json` in the project root.
+**Project scope**: add to `.mcp.json` in the project root, with the absolute path of the binary (replace `/Users/you`):
 
 ```json
 {
   "mcpServers": {
     "stalwart": {
       "type": "stdio",
-      "command": "/bin/sh",
-      "args": [
-        "-c",
-        "set -a; . \"$HOME/.config/stalwart-mcp/personal.env\"; set +a; exec \"$HOME/.cargo/bin/stalwart-mcp\" --config \"$HOME/.config/stalwart-mcp/config.toml\" serve --stdio"
-      ]
+      "command": "/Users/you/.cargo/bin/stalwart-mcp",
+      "args": ["serve", "--stdio"]
     }
   }
 }
 ```
 
+- Add `"--config", "/path/to/config.toml"` before `serve` when the config is not at the default path.
 - Keep `.mcp.json` git-ignored if it is machine-specific (this repository's `.gitignore` already does).
 - Claude Code asks once to approve a project server.
 - Start a new session afterwards; running sessions do not pick up the change.
 
-**User scope** (all projects), the same wrapper through `claude mcp add`:
+**User scope** (all projects), through `claude mcp add` (the shell expands `$HOME`):
 
 ```bash
-claude mcp add --scope user stalwart -- /bin/sh -c 'set -a; . "$HOME/.config/stalwart-mcp/personal.env"; set +a; exec "$HOME/.cargo/bin/stalwart-mcp" --config "$HOME/.config/stalwart-mcp/config.toml" serve --stdio'
+claude mcp add --scope user stalwart -- "$HOME/.cargo/bin/stalwart-mcp" serve --stdio
 ```
 
 **Check**: run `claude mcp list` in a shell, or `/mcp` inside a session. `stalwart` should show as connected.
@@ -256,6 +266,44 @@ Open Settings, Developer, Edit Config, or edit the file directly:
 {
   "mcpServers": {
     "stalwart": {
+      "command": "/Users/you/.cargo/bin/stalwart-mcp",
+      "args": ["serve", "--stdio"]
+    }
+  }
+}
+```
+
+Desktop does not expand `$HOME` or `~` in `command`, so give the absolute path. Restart Desktop afterwards.
+
+### Other MCP clients (stdio)
+
+- Command: the absolute path of `stalwart-mcp`.
+- Args: `serve --stdio`, with `--config <path>` first when the config is not at `~/.config/stalwart-mcp/config.toml`.
+- Environment: nothing for the 1Password, Keychain and command sources; for the `env` source, the variable named by `password_env` (default `STALWART_PASSWORD`) must be set for the process the client launches.
+
+### Fallback: environment variable
+
+For accounts with the `env` source, keep the password out of every client config file in a small env file that exports only the password variable, and let the client start the server through a wrapper:
+
+```
+~/.config/stalwart-mcp/config.toml     mode 0600, accounts with password_env
+~/.config/stalwart-mcp/personal.env    mode 0600, exports only the password variable
+```
+
+```bash
+mkdir -p ~/.config/stalwart-mcp
+cat > ~/.config/stalwart-mcp/personal.env <<'ENV'
+STALWART_PASSWORD='your-password'
+ENV
+chmod 600 ~/.config/stalwart-mcp/personal.env ~/.config/stalwart-mcp/config.toml
+```
+
+The wrapper runs `/bin/sh -c`, which sources the env file (`set -a` exports every variable it defines), then `exec`s the binary. In `.mcp.json` or the Claude Desktop config:
+
+```json
+{
+  "mcpServers": {
+    "stalwart": {
       "command": "/bin/sh",
       "args": [
         "-c",
@@ -266,15 +314,13 @@ Open Settings, Developer, Edit Config, or edit the file directly:
 }
 ```
 
-Desktop does not expand `$HOME` in `command`, so the wrapper script does it. Restart Desktop afterwards.
+Or for Claude Code at user scope:
 
-The `/bin/sh` wrapper is for macOS and Linux. On Windows, point `command` at the binary, put `--config <path>`, `serve` and `--stdio` in `args`, and carry the password variable in the entry's `env` block (for example `"env": { "STALWART_PASSWORD": "your-password" }`); that file then contains the password, so keep it private.
+```bash
+claude mcp add --scope user stalwart -- /bin/sh -c 'set -a; . "$HOME/.config/stalwart-mcp/personal.env"; set +a; exec "$HOME/.cargo/bin/stalwart-mcp" --config "$HOME/.config/stalwart-mcp/config.toml" serve --stdio'
+```
 
-### Other MCP clients (stdio)
-
-- Command: `stalwart-mcp` (or its full path), or the `/bin/sh -c` wrapper above.
-- Args: `--config <path> serve --stdio` (`--config` defaults to `~/.config/stalwart-mcp/config.toml`).
-- Environment: the variable named by `password_env` (default `STALWART_PASSWORD`) must be set for the process the client launches.
+The `/bin/sh` wrapper is for macOS and Linux. On Windows, point `command` at the binary, put `--config <path>`, `serve` and `--stdio` in `args`, and carry the password variable in the entry's `env` block (for example `"env": { "STALWART_PASSWORD": "your-password" }`); that file then contains the password, so keep it private, or use the 1Password source instead.
 
 ### Remote or shared use over HTTP
 
@@ -317,6 +363,8 @@ Every client gets the same tools, limited by the token scopes over HTTP. The cap
 
 - Tools do not appear: restart the client (Claude Code needs a new session), approve the project server when asked, and run `claude mcp list`.
 - Authentication failed or `Environment variable 'STALWART_PASSWORD' not set`: the password variable is not set in the environment the client launches; check the env file path in the wrapper.
+- An account is skipped with `password_command failed`: run `stalwart-mcp account test <name>` in a terminal. For 1Password, check that the app is running and unlocked and the CLI integration is on; for the Keychain, check the item with `security find-generic-password -s stalwart-mcp -a <name>`.
+- `... is writable by group or others` at startup: the config contains a `password_command`; run the `chmod` the message names.
 - 401 over HTTP: the token is missing or expired, or a proxy forwarded headers while no `auth.secret` is set.
 - `Forbidden: this token lacks the '<scope>' scope`: create a new token with that scope.
 - A tool says it is disabled (for example `Sending emails is disabled`): enable its flag under `[capabilities]` and restart the server.
@@ -350,11 +398,19 @@ stalwart-mcp account add            Add an account (checks the credentials first
     --url <URL>                     JMAP server URL, e.g. https://mail.example.com
     --username <USER>               Login username
     --default                       Make it the default account (the first account always is)
-    --password-source <SOURCE>      env or command (1password and keychain: not available yet)
+    --password-source <SOURCE>      1password, keychain (macOS), env or command; inferred
+                                    from the flags below, asked for on a terminal
     --password-env <VAR>            Environment variable holding the password (source env)
     --password-command <ARG>        Program and arguments that print the password, one flag
                                     per argument (source command); the program is stored
                                     as an absolute path
+    --op-reference <op://...>       Existing 1Password item field, op://vault/item/field
+                                    (source 1password; stored by ids)
+    --op-vault <VAULT>              Create a new 1Password Login item in this vault
+                                    (source 1password)
+    --password-stdin                Read the password to store from stdin instead of
+                                    typing it (sources 1password and keychain)
+    --force                         Overwrite an existing Keychain item (source keychain)
     --no-verify                     Write without checking the credentials
     -y, --yes                       Do not ask for confirmation
 
@@ -362,10 +418,13 @@ stalwart-mcp account list           Name, URL, username, password source, defaul
     --json                          Stable machine-readable output
 
 stalwart-mcp account edit <NAME>    Change only the given values; same flags as add, plus
-    --rename <NAME>                 New name (the default account follows a rename)
+    --rename <NAME>                 New name (the default account follows a rename, and so
+                                    does the account's own Keychain item)
 
 stalwart-mcp account remove <NAME>  Remove an account; a removed default moves to the
     -y, --yes                       first remaining account
+    --delete-secret                 Also delete the account's Keychain item (never a
+                                    1Password item); without it a terminal run asks
 
 stalwart-mcp account test [NAME]    Connect one or all accounts, print ok or the error;
                                     exits non-zero when any account fails
@@ -374,7 +433,7 @@ Global options:
     -c, --config <PATH>             Path to config file
 ```
 
-The `account` commands need no existing config: `account add` creates the file (mode 0600, directory 0700) and keeps comments and unknown keys when it edits one. A value missing from the flags is asked for when stdin is a terminal; otherwise the error names the flag, and confirmations need `--yes`. `add` and `edit` check the credentials against the server before anything is written (when the URL, username or password source changes), then write the config and read the password from the stored source once more as a final check. Passwords are never shown, and `list` shows only the program name of a password command, not its arguments.
+The `account` commands need no existing config: `account add` creates the file (mode 0600, directory 0700) and keeps comments and unknown keys when it edits one. A value missing from the flags is asked for when stdin is a terminal; otherwise the error names the flag, and confirmations need `--yes`. `add` and `edit` check the credentials against the server before anything is written (when the URL, username or password source changes), then store the password (1Password, Keychain), write the config and read the password from the stored source once more as a final check. When a step after storing fails, the 1Password or Keychain item this run created is deleted again; if that fails too, the error names the item to delete by hand. Passwords are never shown, never passed on a command line (they reach `op` and `security` on stdin), and `list` shows only the program name of a password command, not its arguments.
 
 ## Development
 

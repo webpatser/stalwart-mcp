@@ -11,7 +11,14 @@
 //! [`ChosenSource::password`] / [`ChosenSource::store`] are the one place
 //! where a source yields the password to verify with, and the
 //! [`PasswordSetting`] for the config plus an optional [`StoredSecret`] that a
-//! later failure rolls back.
+//! later failure rolls back. The 1Password and Keychain programs come from
+//! [`SecretStores`], which tests replace with fake scripts.
+//!
+//! Renaming an account whose source is its own Keychain item (service
+//! `stalwart-mcp`, account = the old name) moves the item: the password is
+//! stored under the new name, the config is written and checked, and only
+//! then is the old item deleted. A failure before that point deletes the new
+//! item again and leaves the old one untouched.
 
 use super::{CliError, Prompter, Verifier};
 use crate::config::{AccountConfig, AppConfig, DEFAULT_PASSWORD_ENV};
@@ -19,6 +26,10 @@ use crate::config_edit::{
     AccountEntry, AccountUpdate, ConfigDocument, DefaultAccountChange, PasswordSetting,
 };
 use crate::secret::{DEFAULT_COMMAND_TIMEOUT, Secret, run_password_command};
+use crate::secret_store::{
+    CreatedItem, KEYCHAIN_SERVICE, Keychain, NewLogin, OnePassword, OpAccount, OpReference,
+    SecretStores, StoreError, check_keychain_password, is_executable_file, matching_items,
+};
 use clap::{Args, Subcommand, ValueEnum};
 use std::ffi::OsStr;
 use std::fmt;
@@ -109,6 +120,14 @@ pub struct SourceArgs {
     /// Read the password to store from stdin (sources 1password and keychain)
     #[arg(long)]
     pub password_stdin: bool,
+
+    /// Overwrite an existing Keychain item (source keychain)
+    #[arg(long)]
+    pub force: bool,
+
+    /// Keychain service name; only for tests and the live check
+    #[arg(long, hide = true, value_name = "SERVICE")]
+    pub keychain_service: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -186,10 +205,15 @@ pub struct RemoveArgs {
     /// Also delete the stored Keychain item (never a 1Password item)
     #[arg(long)]
     pub delete_secret: bool,
+
+    /// Keychain service name; only for tests and the live check
+    #[arg(long, hide = true, value_name = "SERVICE")]
+    pub keychain_service: Option<String>,
 }
 
-/// Run one `account` subcommand against the config at `path`. Returns
-/// `Ok(false)` when `test` found a failing account.
+/// Run one `account` subcommand against the config at `path` with the
+/// password stores of this system. Returns `Ok(false)` when `test` found a
+/// failing account.
 pub async fn run(
     command: AccountCommand,
     path: &Path,
@@ -197,29 +221,116 @@ pub async fn run(
     verifier: &impl Verifier,
     out: &mut impl Write,
 ) -> Result<bool, CliError> {
+    run_with_stores(
+        command,
+        path,
+        prompter,
+        verifier,
+        &SecretStores::system(),
+        out,
+    )
+    .await
+}
+
+/// [`run`] with explicit password stores (tests pass fake programs).
+pub async fn run_with_stores(
+    command: AccountCommand,
+    path: &Path,
+    prompter: &mut impl Prompter,
+    verifier: &impl Verifier,
+    stores: &SecretStores,
+    out: &mut impl Write,
+) -> Result<bool, CliError> {
     match command {
-        AccountCommand::Add(args) => add(args, path, prompter, verifier, out).await?,
+        AccountCommand::Add(args) => {
+            let stores = with_keychain_service(stores, args.source.keychain_service.as_deref())?;
+            add(args, path, &stores, prompter, verifier, out).await?;
+        }
         AccountCommand::List { json } => list(path, json, out)?,
-        AccountCommand::Edit(args) => edit(args, path, prompter, verifier, out).await?,
-        AccountCommand::Remove(args) => remove(args, path, prompter, out)?,
+        AccountCommand::Edit(args) => {
+            let stores = with_keychain_service(stores, args.source.keychain_service.as_deref())?;
+            edit(args, path, &stores, prompter, verifier, out).await?;
+        }
+        AccountCommand::Remove(args) => {
+            let stores = with_keychain_service(stores, args.keychain_service.as_deref())?;
+            remove(args, path, &stores, prompter, out).await?;
+        }
         AccountCommand::Test { name } => return test(path, name.as_deref(), verifier, out).await,
     }
     Ok(true)
 }
 
+/// Apply the hidden `--keychain-service` override. Only `stalwart-mcp` and
+/// `stalwart-mcp-<suffix>` are accepted, so the override cannot point the
+/// CLI (or `--delete-secret`) at another program's Keychain items.
+fn with_keychain_service(
+    stores: &SecretStores,
+    service: Option<&str>,
+) -> Result<SecretStores, CliError> {
+    let mut stores = stores.clone();
+    let Some(service) = service else {
+        return Ok(stores);
+    };
+    let valid = service == KEYCHAIN_SERVICE
+        || service.strip_prefix("stalwart-mcp-").is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix.len() <= MAX_NAME_LEN
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+    if !valid {
+        return Err(CliError::Usage(format!(
+            "invalid --keychain-service '{service}': use stalwart-mcp or stalwart-mcp-<suffix>"
+        )));
+    }
+    stores.keychain = stores.keychain.map(|k| k.with_service(service));
+    Ok(stores)
+}
+
 /// A password source picked for an account, before anything is stored.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ChosenSource {
     /// Read from this environment variable.
     Env(String),
     /// Run this argv; the program is an absolute path.
     Command(Vec<String>),
+    /// An existing 1Password item: the final `op read` argv (ids only).
+    OnePasswordItem(Vec<String>),
+    /// A new 1Password Login item, created from a typed password.
+    OnePasswordNew {
+        op: OnePassword,
+        /// The `--account` id.
+        account: String,
+        /// The vault given by the user (name or id).
+        vault: String,
+        password: Secret,
+    },
+    /// A Keychain item under the account name, from a typed password.
+    Keychain {
+        keychain: Keychain,
+        password: Secret,
+        /// Overwrite an existing item (`--force`).
+        force: bool,
+    },
 }
 
 /// A secret this run wrote into a store (1Password, Keychain), kept so a later
-/// failure can undo exactly that. The env and command sources store nothing.
+/// failure can undo exactly that. The env and command sources store nothing,
+/// and neither does a Keychain item that existed before (`--force`): that one
+/// was overwritten, not created.
 #[derive(Debug)]
-pub enum StoredSecret {}
+pub enum StoredSecret {
+    OnePassword {
+        op: OnePassword,
+        account: String,
+        item: CreatedItem,
+    },
+    Keychain {
+        keychain: Keychain,
+        account: String,
+    },
+}
 
 /// A rollback that did not succeed: the item to remove by hand and why.
 #[derive(Debug)]
@@ -231,13 +342,53 @@ pub struct RollbackFailed {
 impl StoredSecret {
     /// Delete what this run stored. `Ok` names what was removed.
     pub async fn roll_back(self) -> Result<String, RollbackFailed> {
-        match self {}
+        match self {
+            Self::OnePassword { op, account, item } => {
+                let name = format!(
+                    "1Password item {} in vault {} (account {account})",
+                    item.item_id, item.vault_id
+                );
+                match op.item_delete(&account, &item).await {
+                    Ok(()) => Ok(name),
+                    Err(e) => Err(RollbackFailed {
+                        item: name,
+                        reason: e.to_string(),
+                    }),
+                }
+            }
+            Self::Keychain { keychain, account } => {
+                let name = keychain_item_name(&keychain, &account);
+                match keychain.delete(&account).await {
+                    Ok(()) => Ok(name),
+                    Err(e) => Err(RollbackFailed {
+                        item: format!("{name} (`{}`)", keychain.delete_hint(&account)),
+                        reason: e.to_string(),
+                    }),
+                }
+            }
+        }
     }
+}
+
+fn keychain_item_name(keychain: &Keychain, account: &str) -> String {
+    format!(
+        "Keychain item (service '{}', account '{account}')",
+        keychain.service()
+    )
+}
+
+fn copy_secret(secret: &Secret) -> Secret {
+    Secret::new(secret.expose().to_string())
+}
+
+fn store_failed(what: &str, e: StoreError) -> CliError {
+    CliError::Failed(format!("{what}: {e}; nothing was written"))
 }
 
 impl ChosenSource {
     /// The password to verify with, obtained in memory: the variable's value,
-    /// or the output of one run of the command.
+    /// the output of one run of the command (or `op read`), or a copy of the
+    /// typed password.
     pub async fn password(&self, account: &str) -> Result<Secret, CliError> {
         match self {
             Self::Env(var) => std::env::var(var).map(Secret::new).map_err(|_| {
@@ -246,39 +397,157 @@ impl ChosenSource {
                      pass --no-verify to write the account without checking it"
                 ))
             }),
-            Self::Command(argv) => run_password_command(argv, DEFAULT_COMMAND_TIMEOUT)
-                .await
-                .map_err(|e| {
-                    CliError::Failed(format!(
-                        "account '{account}': the password command failed: {e}"
-                    ))
-                }),
+            Self::Command(argv) | Self::OnePasswordItem(argv) => {
+                run_password_command(argv, DEFAULT_COMMAND_TIMEOUT)
+                    .await
+                    .map_err(|e| {
+                        CliError::Failed(format!(
+                            "account '{account}': the password command failed: {e}"
+                        ))
+                    })
+            }
+            Self::OnePasswordNew { password, .. } | Self::Keychain { password, .. } => {
+                Ok(copy_secret(password))
+            }
         }
     }
 
+    /// The typed password of a storing source, known without running anything.
+    fn known_password(&self) -> Option<Secret> {
+        match self {
+            Self::OnePasswordNew { password, .. } | Self::Keychain { password, .. } => {
+                Some(copy_secret(password))
+            }
+            _ => None,
+        }
+    }
+
+    /// Checks that need no secret, run before the credential check: an
+    /// existing Keychain item needs `--force`, and `--force` never overwrites
+    /// an item another account in the config reads.
+    async fn preflight(&self, name: &str, others: &[AccountEntry]) -> Result<(), CliError> {
+        let Self::Keychain {
+            keychain, force, ..
+        } = self
+        else {
+            return Ok(());
+        };
+        if let Some(other) = others.iter().find(|a| match &a.password {
+            PasswordSetting::Command(argv) => keychain.item_of(argv) == Some(name),
+            _ => false,
+        }) {
+            return Err(CliError::Usage(format!(
+                "the {} is the password source of account '{}'; pick another name",
+                keychain_item_name(keychain, name),
+                other.name
+            )));
+        }
+        let exists = keychain
+            .exists(name)
+            .await
+            .map_err(|e| store_failed("checking the Keychain failed", e))?;
+        if exists && !force {
+            return Err(CliError::Usage(format!(
+                "a {} already exists; pass --force to overwrite it",
+                keychain_item_name(keychain, name)
+            )));
+        }
+        Ok(())
+    }
+
     /// Store the secret for sources that hold one, and return the setting to
-    /// write plus the handle that undoes the store.
+    /// write plus the handle that undoes the store. `entry` gives the account
+    /// name, URL and username (the password setting in it is ignored).
     pub async fn store(
         &self,
-        _account: &str,
-        _password: Option<&Secret>,
+        entry: &AccountEntry,
     ) -> Result<(PasswordSetting, Option<StoredSecret>), CliError> {
         match self {
             Self::Env(var) => Ok((PasswordSetting::Env(var.clone()), None)),
-            Self::Command(argv) => Ok((PasswordSetting::Command(argv.clone()), None)),
+            Self::Command(argv) | Self::OnePasswordItem(argv) => {
+                Ok((PasswordSetting::Command(argv.clone()), None))
+            }
+            Self::OnePasswordNew {
+                op,
+                account,
+                vault,
+                password,
+            } => {
+                let title = format!("stalwart-mcp {}", entry.name);
+                let item = op
+                    .item_create(
+                        account,
+                        vault,
+                        &NewLogin {
+                            title: &title,
+                            username: &entry.username,
+                            url: &entry.url,
+                            password,
+                        },
+                    )
+                    .await
+                    .map_err(|e| store_failed("creating the 1Password item failed", e))?;
+                let argv = op.read_command(
+                    account,
+                    &OpReference::password_of(&item.vault_id, &item.item_id),
+                );
+                let stored = StoredSecret::OnePassword {
+                    op: op.clone(),
+                    account: account.clone(),
+                    item,
+                };
+                Ok((PasswordSetting::Command(argv), Some(stored)))
+            }
+            Self::Keychain {
+                keychain,
+                password,
+                force,
+            } => {
+                let exists = keychain
+                    .exists(&entry.name)
+                    .await
+                    .map_err(|e| store_failed("checking the Keychain failed", e))?;
+                if exists && !force {
+                    return Err(CliError::Usage(format!(
+                        "a {} already exists; pass --force to overwrite it",
+                        keychain_item_name(keychain, &entry.name)
+                    )));
+                }
+                keychain
+                    .store(&entry.name, password, exists)
+                    .await
+                    .map_err(|e| store_failed("storing the password in the Keychain failed", e))?;
+                let setting = PasswordSetting::Command(keychain.password_command(&entry.name));
+                // An overwritten item is not ours to delete on rollback.
+                let stored = (!exists).then(|| StoredSecret::Keychain {
+                    keychain: keychain.clone(),
+                    account: entry.name.clone(),
+                });
+                Ok((setting, stored))
+            }
         }
     }
 }
 
+/// What [`choose_source`] needs besides the flags.
+#[derive(Debug)]
+pub struct SourceContext<'a> {
+    /// The account's present setting (`edit`), used for prompt defaults.
+    pub current: Option<&'a PasswordSetting>,
+    /// False for `edit`, where no source flag means "keep it".
+    pub required: bool,
+    /// Host of the mail server URL, to find matching 1Password items.
+    pub mail_host: &'a str,
+    pub stores: &'a SecretStores,
+}
+
 /// Turn the source flags (and, when interactive, answers) into a source.
-/// `required` is false for `edit`, where no source flag means "keep it".
-/// `current` is the account's present setting, used for prompt defaults.
-pub fn choose_source(
+pub async fn choose_source(
     args: &SourceArgs,
-    current: Option<&PasswordSetting>,
-    required: bool,
+    ctx: &SourceContext<'_>,
     prompter: &mut impl Prompter,
 ) -> Result<Option<ChosenSource>, CliError> {
+    let (current, required) = (ctx.current, ctx.required);
     let inferred = if args.password_env.is_some() {
         Some((SourceKind::Env, "--password-env"))
     } else if !args.password_command.is_empty() {
@@ -306,21 +575,24 @@ pub fn choose_source(
             kind.map(SourceKind::as_str).unwrap_or_default()
         )));
     }
+    if args.force && kind.is_some_and(|k| k != SourceKind::Keychain) {
+        return Err(CliError::Usage(
+            "--force only goes with --password-source keychain".into(),
+        ));
+    }
     let kind = match kind {
         Some(kind) => kind,
         None if args.password_stdin => {
-            return Err(CliError::NotAvailable(
-                "--password-stdin (for the 1password and keychain sources)".into(),
+            return Err(CliError::Usage(
+                "--password-stdin needs --password-source 1password or keychain".into(),
             ));
         }
         None if !required => return Ok(None),
-        None => ask_source_kind(prompter)?,
+        None => ask_source_kind(ctx.stores, prompter).await?,
     };
     match kind {
-        SourceKind::OnePassword => {
-            Err(CliError::NotAvailable("--password-source 1password".into()))
-        }
-        SourceKind::Keychain => Err(CliError::NotAvailable("--password-source keychain".into())),
+        SourceKind::OnePassword => one_password_source(args, ctx, prompter).await.map(Some),
+        SourceKind::Keychain => keychain_source(args, ctx.stores, prompter).map(Some),
         SourceKind::Env => {
             let default = current
                 .and_then(PasswordSetting::env_var)
@@ -361,17 +633,285 @@ pub fn choose_source(
     }
 }
 
-fn ask_source_kind(prompter: &mut impl Prompter) -> Result<SourceKind, CliError> {
+/// Ask for the source. The suggested default is 1Password when `op` is found
+/// and has an account, else the Keychain (macOS), else env. Never chosen
+/// silently: without a terminal this is an error naming the flag.
+async fn ask_source_kind(
+    stores: &SecretStores,
+    prompter: &mut impl Prompter,
+) -> Result<SourceKind, CliError> {
     if !prompter.interactive() {
         return Err(CliError::Usage(
-            "missing --password-source (env or command) and no terminal to ask on".into(),
+            "missing --password-source (1password, keychain, env or command) and no terminal to \
+             ask on"
+                .into(),
         ));
     }
-    let answer = prompter.ask("Password source (env, command)", Some("env"))?;
+    let op_ready = match &stores.op {
+        Some(op) => op
+            .accounts()
+            .await
+            .is_ok_and(|accounts| accounts.iter().any(|a| a.id().is_some())),
+        None => false,
+    };
+    let default = if op_ready {
+        SourceKind::OnePassword
+    } else if stores.keychain.is_some() {
+        SourceKind::Keychain
+    } else {
+        SourceKind::Env
+    };
+    let offered: Vec<&str> = [
+        (op_ready, SourceKind::OnePassword),
+        (stores.keychain.is_some(), SourceKind::Keychain),
+        (true, SourceKind::Env),
+        (true, SourceKind::Command),
+    ]
+    .into_iter()
+    .filter_map(|(available, kind)| available.then_some(kind.as_str()))
+    .collect();
+    let answer = prompter.ask(
+        &format!("Password source ({})", offered.join(", ")),
+        Some(default.as_str()),
+    )?;
     let answer = answer.trim();
-    let answer = if answer.is_empty() { "env" } else { answer };
+    let answer = if answer.is_empty() {
+        default.as_str()
+    } else {
+        answer
+    };
     SourceKind::from_str(answer, true)
         .map_err(|_| CliError::Usage(format!("unknown password source '{answer}'")))
+}
+
+/// The password to store: from stdin with `--password-stdin`, else typed
+/// on the terminal (not echoed).
+fn typed_password(
+    args: &SourceArgs,
+    question: &str,
+    prompter: &mut impl Prompter,
+) -> Result<Secret, CliError> {
+    if args.password_stdin {
+        return prompter.read_password_stdin();
+    }
+    if !prompter.interactive() {
+        return Err(CliError::Usage(
+            "missing --password-stdin and no terminal to type the password on".into(),
+        ));
+    }
+    let password = prompter.ask_secret(question)?;
+    if password.expose().is_empty() {
+        return Err(CliError::Usage("no password given".into()));
+    }
+    Ok(password)
+}
+
+fn keychain_source(
+    args: &SourceArgs,
+    stores: &SecretStores,
+    prompter: &mut impl Prompter,
+) -> Result<ChosenSource, CliError> {
+    let keychain = stores.keychain.clone().ok_or_else(|| {
+        CliError::Usage(
+            "the Keychain source is only available on macOS; use --password-source 1password, \
+             env or command"
+                .into(),
+        )
+    })?;
+    let password = typed_password(
+        args,
+        "Mailbox password (stored in the macOS Keychain)",
+        prompter,
+    )?;
+    check_keychain_password(&password).map_err(|e| CliError::Usage(e.to_string()))?;
+    Ok(ChosenSource::Keychain {
+        keychain,
+        password,
+        force: args.force,
+    })
+}
+
+async fn one_password_source(
+    args: &SourceArgs,
+    ctx: &SourceContext<'_>,
+    prompter: &mut impl Prompter,
+) -> Result<ChosenSource, CliError> {
+    let op = ctx.stores.op.clone().ok_or_else(|| {
+        CliError::Usage(
+            "the 1Password CLI (op) was not found on PATH, in /opt/homebrew/bin or in \
+             /usr/local/bin; install it and switch on the CLI integration in the 1Password app, \
+             or pick another --password-source"
+                .into(),
+        )
+    })?;
+    let accounts = op
+        .accounts()
+        .await
+        .map_err(|e| CliError::Failed(format!("1Password: {e}")))?;
+    let account = pick_op_account(&accounts, prompter)?;
+
+    if let Some(reference) = &args.op_reference {
+        return reference_source(&op, &account, reference).await;
+    }
+    let create = if args.op_vault.is_some() || args.password_stdin {
+        true
+    } else if !prompter.interactive() {
+        return Err(CliError::Usage(
+            "missing --op-reference (an existing item) or --op-vault (a new item) and no \
+             terminal to ask on"
+                .into(),
+        ));
+    } else {
+        let answer = prompter.ask(
+            "Use an existing 1Password item or create a new one (existing, new)",
+            Some("existing"),
+        )?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" | "existing" | "e" => false,
+            "new" | "n" => true,
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown answer '{other}'; expected existing or new"
+                )));
+            }
+        }
+    };
+    if !create {
+        return pick_item_source(&op, &account, ctx.mail_host, prompter).await;
+    }
+    let vault = required_value(
+        args.op_vault.clone(),
+        "--op-vault",
+        "1Password vault for the new item",
+        None,
+        prompter,
+    )?;
+    let password = typed_password(
+        args,
+        "Mailbox password (stored in a new 1Password item)",
+        prompter,
+    )?;
+    Ok(ChosenSource::OnePasswordNew {
+        op,
+        account,
+        vault,
+        password,
+    })
+}
+
+/// The `--account` id: the only account, or the one picked on the terminal.
+fn pick_op_account(
+    accounts: &[OpAccount],
+    prompter: &mut impl Prompter,
+) -> Result<String, CliError> {
+    let usable: Vec<(&OpAccount, &str)> = accounts
+        .iter()
+        .filter_map(|a| a.id().map(|id| (a, id)))
+        .collect();
+    match usable[..] {
+        [] => Err(CliError::Failed(
+            "1Password: op lists no accounts; sign in with `op signin` or switch on the CLI \
+             integration in the 1Password app (Settings, Developer)"
+                .into(),
+        )),
+        [(_, id)] => Ok(id.to_string()),
+        _ if !prompter.interactive() => Err(CliError::Usage(
+            "several 1Password accounts are set up and there is no terminal to pick one on".into(),
+        )),
+        _ => {
+            let mut question = String::from("1Password accounts:\n");
+            for (n, (account, _)) in usable.iter().enumerate() {
+                question.push_str(&format!(
+                    "  {}) {} ({})\n",
+                    n + 1,
+                    printable(&account.url),
+                    printable(&account.email)
+                ));
+            }
+            question.push_str("Number of the account");
+            let answer = prompter.ask(&question, Some("1"))?;
+            let index = pick_index(&answer, usable.len())?;
+            Ok(usable[index].1.to_string())
+        }
+    }
+}
+
+/// A 0-based index from a 1-based answer (empty means 1).
+fn pick_index(answer: &str, len: usize) -> Result<usize, CliError> {
+    let answer = answer.trim();
+    let answer = if answer.is_empty() { "1" } else { answer };
+    answer
+        .parse::<usize>()
+        .ok()
+        .filter(|n| (1..=len).contains(n))
+        .map(|n| n - 1)
+        .ok_or_else(|| CliError::Usage(format!("'{answer}' is not a number from 1 to {len}")))
+}
+
+/// Text from `op` output shown on the terminal, without control characters.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// Offer the Login items that match the mail host; the answer is a number or
+/// an `op://` reference.
+async fn pick_item_source(
+    op: &OnePassword,
+    account: &str,
+    mail_host: &str,
+    prompter: &mut impl Prompter,
+) -> Result<ChosenSource, CliError> {
+    let items = op
+        .item_list(account)
+        .await
+        .map_err(|e| CliError::Failed(format!("1Password: {e}")))?;
+    let matches = matching_items(&items, mail_host);
+    if matches.is_empty() {
+        let reference = required_value(
+            None,
+            "--op-reference",
+            &format!(
+                "No 1Password Login item matches {mail_host}; reference of the password \
+                 (op://vault/item/field)"
+            ),
+            None,
+            prompter,
+        )?;
+        return reference_source(op, account, &reference).await;
+    }
+    let mut question = format!("1Password Login items matching {mail_host}:\n");
+    for (n, item) in matches.iter().enumerate() {
+        question.push_str(&format!(
+            "  {}) {} (vault {})\n",
+            n + 1,
+            printable(&item.title),
+            printable(&item.vault.name)
+        ));
+    }
+    question.push_str("Number of the item, or an op:// reference");
+    let answer = prompter.ask(&question, Some("1"))?;
+    if answer.trim().starts_with("op://") {
+        return reference_source(op, account, answer.trim()).await;
+    }
+    let item = matches[pick_index(&answer, matches.len())?];
+    let reference = OpReference::password_of(&item.vault.id, &item.id).to_uri();
+    reference_source(op, account, &reference).await
+}
+
+/// Resolve a reference to ids and build the `op read` argv.
+async fn reference_source(
+    op: &OnePassword,
+    account: &str,
+    reference: &str,
+) -> Result<ChosenSource, CliError> {
+    let parsed = OpReference::parse(reference).map_err(|e| CliError::Usage(e.to_string()))?;
+    let resolved = op
+        .resolve(account, &parsed)
+        .await
+        .map_err(|e| CliError::Failed(format!("1Password: {e}")))?;
+    Ok(ChosenSource::OnePasswordItem(
+        op.read_command(account, &resolved),
+    ))
 }
 
 /// Resolve `program` to an absolute path: a path with a `/` is taken as is
@@ -419,24 +959,6 @@ pub fn resolve_program(
         .into_os_string()
         .into_string()
         .map_err(|_| CliError::Usage("the password command path is not valid UTF-8".into()))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        meta.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 /// New and renamed account names: `[A-Za-z0-9_-]{1,64}`.
@@ -600,9 +1122,18 @@ async fn roll_back(stored: Option<StoredSecret>) -> String {
     }
 }
 
+/// The host of a validated URL, lowercased (empty if it has none).
+fn mail_host(url: &str) -> String {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_default()
+}
+
 async fn add(
     args: AddArgs,
     path: &Path,
+    stores: &SecretStores,
     prompter: &mut impl Prompter,
     verifier: &impl Verifier,
     out: &mut impl Write,
@@ -628,8 +1159,17 @@ async fn add(
     validate_url(&url)?;
     let username = required_value(args.username, "--username", "Username", None, prompter)?;
     validate_username(&username)?;
-    let source = choose_source(&args.source, None, true, prompter)?
+    let host = mail_host(&url);
+    let ctx = SourceContext {
+        current: None,
+        required: true,
+        mail_host: &host,
+        stores,
+    };
+    let source = choose_source(&args.source, &ctx, prompter)
+        .await?
         .ok_or_else(|| CliError::Usage("missing --password-source".into()))?;
+    source.preflight(&name, &existing).await?;
 
     let probe = AccountEntry {
         name: name.clone(),
@@ -638,7 +1178,8 @@ async fn add(
         password: PasswordSetting::DefaultEnv,
     };
     let password = if args.no_verify {
-        None
+        // A typed password is still compared with what the store returns.
+        source.known_password()
     } else {
         let password = source.password(&name).await?;
         verify(verifier, &account_config(&probe), &password, out).await?;
@@ -652,7 +1193,7 @@ async fn add(
         prompter,
     )?;
 
-    let (setting, stored) = source.store(&name, password.as_ref()).await?;
+    let (setting, stored) = source.store(&probe).await?;
     let entry = AccountEntry {
         password: setting,
         ..probe
@@ -738,9 +1279,22 @@ fn undo_add(doc: &mut ConfigDocument, name: &str, previous_default: Option<&str>
     }
 }
 
+/// The Keychain item a setting reads, when it has the exact shape this CLI
+/// writes for the configured program and service.
+fn keychain_item(stores: &SecretStores, setting: &PasswordSetting) -> Option<(Keychain, String)> {
+    let keychain = stores.keychain.as_ref()?;
+    let PasswordSetting::Command(argv) = setting else {
+        return None;
+    };
+    keychain
+        .item_of(argv)
+        .map(|account| (keychain.clone(), account.to_string()))
+}
+
 async fn edit(
     args: EditArgs,
     path: &Path,
+    stores: &SecretStores,
     prompter: &mut impl Prompter,
     verifier: &impl Verifier,
     out: &mut impl Write,
@@ -767,7 +1321,14 @@ async fn edit(
     if let Some(username) = &args.username {
         validate_username(username)?;
     }
-    let source = choose_source(&args.source, Some(&current.password), false, prompter)?;
+    let host = mail_host(args.url.as_deref().unwrap_or(&current.url));
+    let ctx = SourceContext {
+        current: Some(&current.password),
+        required: false,
+        mail_host: &host,
+        stores,
+    };
+    let mut source = choose_source(&args.source, &ctx, prompter).await?;
     if args.rename.is_none()
         && args.url.is_none()
         && args.username.is_none()
@@ -781,6 +1342,42 @@ async fn edit(
     }
 
     let new_name = args.rename.clone().unwrap_or_else(|| current.name.clone());
+    let explicit_source = source.is_some();
+    let old_item = keychain_item(stores, &current.password);
+
+    // A rename moves the account's own Keychain item to the new name, so the
+    // item keeps matching the account (see the module docs).
+    let mut moved_from = None;
+    if source.is_none()
+        && new_name != current.name
+        && let Some((keychain, item_account)) = &old_item
+        && *item_account == current.name
+    {
+        let password = account_config(&current)
+            .resolve_password()
+            .await
+            .map_err(|e| {
+                CliError::Failed(format!(
+                    "reading the Keychain item of '{}' to move it failed: {e}; nothing was changed",
+                    current.name
+                ))
+            })?;
+        source = Some(ChosenSource::Keychain {
+            keychain: keychain.clone(),
+            password,
+            force: args.source.force,
+        });
+        moved_from = Some((keychain.clone(), current.name.clone()));
+    }
+    if let Some(source) = &source {
+        let others: Vec<AccountEntry> = accounts
+            .iter()
+            .filter(|a| a.name != current.name)
+            .cloned()
+            .collect();
+        source.preflight(&new_name, &others).await?;
+    }
+
     let url_changed = args.url.as_ref().is_some_and(|u| u != &current.url);
     let username_changed = args
         .username
@@ -796,7 +1393,7 @@ async fn edit(
         password: current.password.clone(),
     };
 
-    let password = if !args.no_verify && (url_changed || username_changed || source.is_some()) {
+    let password = if !args.no_verify && (url_changed || username_changed || explicit_source) {
         let password = match &source {
             Some(source) => source.password(&new_name).await?,
             None => account_config(&probe).resolve_password().await?,
@@ -804,7 +1401,9 @@ async fn edit(
         verify(verifier, &account_config(&probe), &password, out).await?;
         Some(password)
     } else {
-        None
+        // A typed (or moved) password is still compared with what the store
+        // returns.
+        source.as_ref().and_then(ChosenSource::known_password)
     };
 
     confirm(
@@ -815,7 +1414,7 @@ async fn edit(
 
     let (setting, stored) = match &source {
         Some(source) => {
-            let (setting, stored) = source.store(&new_name, password.as_ref()).await?;
+            let (setting, stored) = source.store(&probe).await?;
             (Some(setting), stored)
         }
         None => (None, None),
@@ -858,6 +1457,31 @@ async fn edit(
     }
     if args.default {
         writeln!(out, "'{new_name}' is the default account")?;
+    }
+    if let Some((keychain, old)) = moved_from {
+        // The config now reads the new item; the old one is no longer used.
+        match keychain.delete(&old).await {
+            Ok(()) => writeln!(
+                out,
+                "Moved the Keychain item from account '{old}' to '{new_name}'"
+            )?,
+            Err(e) => writeln!(
+                out,
+                "The old {} could not be deleted ({e}); delete it with `{}`",
+                keychain_item_name(&keychain, &old),
+                keychain.delete_hint(&old)
+            )?,
+        }
+    } else if let (Some(setting), Some((keychain, old))) = (&setting, &old_item)
+        && keychain_item(stores, setting).is_none_or(|(_, account)| account != *old)
+    {
+        writeln!(
+            out,
+            "The {} is no longer used by this account and was kept; delete it with `{}` if \
+             nothing else needs it",
+            keychain_item_name(keychain, old),
+            keychain.delete_hint(old)
+        )?;
     }
     Ok(())
 }
@@ -909,9 +1533,15 @@ fn undo_edit(
     }
 }
 
-fn remove(
+/// Remove an account. A Keychain item is deleted only with `--delete-secret`
+/// or a confirmed prompt, and only when the stored argv has exactly the shape
+/// this CLI writes (program, service); the item is the one named by that
+/// argv's `-s` and `-a`, not derived from the account name. A 1Password item
+/// is never deleted.
+async fn remove(
     args: RemoveArgs,
     path: &Path,
+    stores: &SecretStores,
     prompter: &mut impl Prompter,
     out: &mut impl Write,
 ) -> Result<(), CliError> {
@@ -921,12 +1551,26 @@ fn remove(
         .into_iter()
         .find(|a| a.name == args.name)
         .ok_or_else(|| no_account(&args.name, path))?;
+    let item = keychain_item(stores, &entry.password);
 
-    if args.delete_secret {
+    if args.delete_secret && item.is_none() {
         return Err(match SourceDescription::of(&entry.password) {
-            SourceDescription::Keychain => {
-                CliError::NotAvailable("--delete-secret for Keychain items".into())
-            }
+            SourceDescription::Keychain if stores.keychain.is_none() => CliError::Usage(
+                "the macOS Keychain is not available on this system, so no item can be deleted; \
+                 run the command without --delete-secret"
+                    .into(),
+            ),
+            SourceDescription::Keychain => CliError::Usage(format!(
+                "the password_command of '{}' is not exactly the Keychain command stalwart-mcp \
+                 writes (service '{}'), so no item is deleted; run the command without \
+                 --delete-secret and delete the item by hand",
+                args.name,
+                stores
+                    .keychain
+                    .as_ref()
+                    .map(Keychain::service)
+                    .unwrap_or(KEYCHAIN_SERVICE)
+            )),
             SourceDescription::OnePassword => CliError::Usage(
                 "1Password items are never deleted by stalwart-mcp; delete it in 1Password if \
                  you no longer need it, and run the command without --delete-secret"
@@ -945,6 +1589,13 @@ fn remove(
         &format!("Remove account '{}' from {}?", args.name, path.display()),
         prompter,
     )?;
+    let delete = match &item {
+        Some(_) if args.delete_secret => true,
+        Some((keychain, account)) if !args.yes && prompter.interactive() => prompter.confirm(
+            &format!("Also delete the {}?", keychain_item_name(keychain, account)),
+        )?,
+        _ => false,
+    };
     let change = doc.remove_account(&args.name)?;
     doc.save()?;
 
@@ -963,6 +1614,28 @@ fn remove(
         )?,
         DefaultAccountChange::Cleared => {
             writeln!(out, "No accounts remain; default_account was removed")?;
+        }
+    }
+    // The config no longer points at the item, so it is deleted last.
+    if let Some((keychain, account)) = item {
+        let name = keychain_item_name(&keychain, &account);
+        if delete {
+            keychain.delete(&account).await.map_err(|e| {
+                CliError::Failed(format!(
+                    "removed '{}' from {}, but deleting the {name} failed: {e}; delete it with \
+                     `{}`",
+                    args.name,
+                    path.display(),
+                    keychain.delete_hint(&account)
+                ))
+            })?;
+            writeln!(out, "Deleted the {name}")?;
+        } else {
+            writeln!(
+                out,
+                "Kept the {name}; delete it with `{}` if nothing else needs it",
+                keychain.delete_hint(&account)
+            )?;
         }
     }
     Ok(())
@@ -1167,12 +1840,15 @@ mod tests {
 
     const FAKE: &str = "not-a-real-password";
 
-    /// Scripted answers; records the questions asked.
+    /// Scripted answers; records the questions asked and their defaults.
     #[derive(Debug, Default)]
     struct Script {
         interactive: bool,
         answers: VecDeque<String>,
         questions: Vec<String>,
+        defaults: Vec<Option<String>>,
+        /// What `--password-stdin` reads.
+        stdin: Option<String>,
     }
 
     impl Script {
@@ -1184,7 +1860,14 @@ mod tests {
             Self {
                 interactive: true,
                 answers: answers.iter().map(|a| a.to_string()).collect(),
-                questions: Vec::new(),
+                ..Self::default()
+            }
+        }
+
+        fn with_stdin(password: &str) -> Self {
+            Self {
+                stdin: Some(password.to_string()),
+                ..Self::default()
             }
         }
 
@@ -1200,11 +1883,21 @@ mod tests {
         fn interactive(&self) -> bool {
             self.interactive
         }
-        fn ask(&mut self, question: &str, _default: Option<&str>) -> Result<String, CliError> {
+        fn ask(&mut self, question: &str, default: Option<&str>) -> Result<String, CliError> {
+            self.defaults.push(default.map(str::to_string));
             self.next(question)
         }
         fn ask_secret(&mut self, question: &str) -> Result<Secret, CliError> {
             self.next(question).map(Secret::new)
+        }
+        fn read_password_stdin(&mut self) -> Result<Secret, CliError> {
+            let bytes = self
+                .stdin
+                .take()
+                .ok_or_else(|| CliError::Usage("no scripted stdin".into()))?
+                .into_bytes();
+            crate::secret_store::password_from_stdin(bytes)
+                .map_err(|e| CliError::Usage(e.to_string()))
         }
         fn confirm(&mut self, question: &str) -> Result<bool, CliError> {
             Ok(self.next(question)? == "y")
@@ -1279,11 +1972,23 @@ mod tests {
         flags
     }
 
+    /// Runs with no password stores, so the tests do not depend on the
+    /// machine (`op` installed, macOS or not).
     async fn run_with(
         args: &[String],
         path: &Path,
         prompter: &mut Script,
         verifier: &FakeVerifier,
+    ) -> (Result<bool, CliError>, String) {
+        run_in(args, path, prompter, verifier, &SecretStores::default()).await
+    }
+
+    async fn run_in(
+        args: &[String],
+        path: &Path,
+        prompter: &mut Script,
+        verifier: &FakeVerifier,
+        stores: &SecretStores,
     ) -> (Result<bool, CliError>, String) {
         let argv = ["stalwart-mcp", "account"]
             .into_iter()
@@ -1294,7 +1999,7 @@ mod tests {
             other => panic!("{other:?}"),
         };
         let mut out = Vec::new();
-        let result = run(action, path, prompter, verifier, &mut out).await;
+        let result = run_with_stores(action, path, prompter, verifier, stores, &mut out).await;
         (result, String::from_utf8(out).expect("utf8"))
     }
 
@@ -1551,7 +2256,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stores_and_typed_password_sources_are_not_available_yet() {
+    async fn store_sources_without_their_programs_are_refused() {
         let (_dir, path) = temp_config();
         let verifier = FakeVerifier::default();
         let base = [
@@ -1564,25 +2269,47 @@ mod tests {
             "u@example.com",
             "--yes",
         ];
-        for extra in [
-            &["--password-source", "1password"][..],
-            &["--password-source", "keychain"],
-            &["--op-reference", "op://vault/item/password"],
-            &["--op-vault", "Private"],
-            &["--password-stdin"],
-            &["--password-source", "keychain", "--password-stdin"],
+        // No stores at all: neither `op` nor the Keychain.
+        for (extra, expected) in [
+            (
+                &["--password-source", "1password"][..],
+                "(op) was not found",
+            ),
+            (
+                &["--password-source", "keychain"],
+                "only available on macOS",
+            ),
+            (
+                &["--op-reference", "op://vault/item/password"],
+                "(op) was not found",
+            ),
+            (&["--op-vault", "Private"], "(op) was not found"),
+            (
+                &["--password-stdin"],
+                "--password-source 1password or keychain",
+            ),
+            (
+                &["--password-source", "keychain", "--password-stdin"],
+                "only available on macOS",
+            ),
         ] {
             let args: Vec<String> = base.iter().chain(extra).map(|a| a.to_string()).collect();
             let (result, _) = run_with(&args, &path, &mut Script::offline(), &verifier).await;
-            let err = result.expect_err("not available");
-            assert!(matches!(err, CliError::NotAvailable(_)), "{extra:?}: {err}");
-            assert!(err.to_string().contains("not available yet"), "{err}");
+            let err = result.expect_err("refused").to_string();
+            assert!(err.contains(expected), "{extra:?}: {err}");
         }
         // Mismatched source flags are usage errors.
         for extra in [
             &["--password-source", "env", "--password-command", "/bin/sh"][..],
             &["--password-source", "command", "--password-env", "X"],
             &["--password-source", "env", "--password-stdin"],
+            &["--password-env", "X", "--force"],
+            &[
+                "--password-source",
+                "keychain",
+                "--keychain-service",
+                "other",
+            ],
         ] {
             let args: Vec<String> = base.iter().chain(extra).map(|a| a.to_string()).collect();
             let (result, _) = run_with(&args, &path, &mut Script::offline(), &verifier).await;
@@ -1854,7 +2581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_delete_secret_for_a_keychain_account_is_not_available_yet() {
+    async fn remove_delete_secret_needs_the_exact_keychain_shape() {
         let (_dir, path) = temp_config();
         let mut doc = ConfigDocument::load_or_new(&path).expect("new");
         doc.add_account(&AccountEntry {
@@ -1872,6 +2599,7 @@ mod tests {
         let args: Vec<String> = ["remove", "k", "--yes", "--delete-secret"]
             .map(String::from)
             .to_vec();
+        // Without a Keychain on this "system".
         let (result, _) = run_with(
             &args,
             &path,
@@ -1879,7 +2607,26 @@ mod tests {
             &FakeVerifier::default(),
         )
         .await;
-        assert!(matches!(result, Err(CliError::NotAvailable(_))));
+        let err = result.expect_err("refused").to_string();
+        assert!(err.contains("not available on this system"), "{err}");
+        // With one, the argv is not the exact shape.
+        let stores = SecretStores {
+            op: None,
+            keychain: Some(Keychain::new(
+                crate::secret_store::SECURITY_PROGRAM,
+                KEYCHAIN_SERVICE,
+            )),
+        };
+        let (result, _) = run_in(
+            &args,
+            &path,
+            &mut Script::offline(),
+            &FakeVerifier::default(),
+            &stores,
+        )
+        .await;
+        let err = result.expect_err("refused").to_string();
+        assert!(err.contains("not exactly the Keychain command"), "{err}");
         assert_eq!(
             ConfigDocument::load_or_new(&path)
                 .expect("load")
@@ -2072,5 +2819,767 @@ mod tests {
             SourceDescription::of(&PasswordSetting::DefaultEnv).to_string(),
             "env STALWART_PASSWORD"
         );
+    }
+
+    /// The 1Password and Keychain sources against fake `op` and `security`
+    /// scripts that record their argv and stdin.
+    #[cfg(unix)]
+    mod stores {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        const FAKE_SECURITY: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+[ -n "$FAKE_PROBE" ] && exit 0
+printf '%s\n' "$*" >> "$d/security.argv"
+case "$1" in
+  -i)
+    line=$(cat)
+    printf '%s\n' "$line" >> "$d/security.stdin"
+    if [ -f "$d/security-fail-add" ]; then echo "add failed" >&2; exit 45; fi
+    acct=$(printf '%s\n' "$line" | sed -n 's/.* -a "\([^"]*\)".*/\1/p')
+    : > "$d/item.$acct"
+    ;;
+  find-generic-password)
+    if [ ! -f "$d/item.$5" ]; then echo "security: The specified item could not be found in the keychain." >&2; exit 44; fi
+    if [ "$6" = "-w" ]; then cat "$d/readback"; fi
+    ;;
+  delete-generic-password)
+    if [ -f "$d/security-fail-delete" ]; then echo "delete failed" >&2; exit 1; fi
+    if [ ! -f "$d/item.$5" ]; then exit 44; fi
+    rm "$d/item.$5"
+    ;;
+  *) echo "unexpected $1" >&2; exit 2 ;;
+esac
+"#;
+
+        const FAKE_OP: &str = r#"#!/bin/sh
+d=$(dirname "$0")
+[ -n "$FAKE_PROBE" ] && exit 0
+printf '%s\n' "$*" >> "$d/op.argv"
+case "$1 $2" in
+  "account list") cat "$d/op.accounts" ;;
+  "item list") cat "$d/op.items" ;;
+  "item get") cat "$d/op.item" ;;
+  "item create")
+    cat >> "$d/op.stdin"
+    if [ -f "$d/op-fail-create" ]; then echo "[ERROR] create failed" >&2; exit 1; fi
+    cat "$d/op.created"
+    ;;
+  "item delete")
+    if [ -f "$d/op-fail-delete" ]; then echo "[ERROR] delete failed" >&2; exit 1; fi
+    ;;
+  "read -n") cat "$d/readback" ;;
+  *) echo "unexpected: $*" >&2; exit 2 ;;
+esac
+"#;
+
+        const ITEM: &str = r#"{"id":"itemid1","title":"Mail work","vault":{"id":"vaultid1","name":"Private"},
+            "fields":[{"id":"username","label":"username"},{"id":"password","label":"password","purpose":"PASSWORD"}]}"#;
+
+        struct Fakes {
+            dir: tempfile::TempDir,
+        }
+
+        impl Fakes {
+            fn new() -> Self {
+                let fakes = Self {
+                    dir: tempfile::tempdir().expect("tempdir"),
+                };
+                for (name, body) in [("security", FAKE_SECURITY), ("op", FAKE_OP)] {
+                    let path = fakes.path(name);
+                    std::fs::write(&path, body).expect("write fake");
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .expect("chmod");
+                }
+                fakes.write(
+                    "op.accounts",
+                    r#"[{"url":"my.1password.com","email":"me@example.com","user_uuid":"USERUUID1","account_uuid":"ACCOUNTUUID1"}]"#,
+                );
+                fakes.write(
+                    "op.items",
+                    r#"[{"id":"otheritem","title":"Other","vault":{"id":"vaultid1","name":"Private"},"urls":[{"href":"https://other.org"}]},
+                        {"id":"urlitem","title":"Mail","vault":{"id":"vaultid1","name":"Private"},"urls":[{"href":"https://example.com"}]},
+                        {"id":"titleitem","title":"mail.example.com login","vault":{"id":"vaultid2","name":"Work"}}]"#,
+                );
+                fakes.write("op.item", ITEM);
+                fakes.write(
+                    "op.created",
+                    r#"{"id":"newitem1","title":"stalwart-mcp work","vault":{"id":"vaultid1","name":"Private"},"fields":[]}"#,
+                );
+                fakes.write("readback", FAKE);
+                // A freshly written script can be "text file busy" on Linux
+                // while a forked test thread still holds the write handle.
+                for name in ["security", "op"] {
+                    probe(&fakes.path(name));
+                }
+                fakes
+            }
+
+            fn path(&self, name: &str) -> PathBuf {
+                self.dir.path().join(name)
+            }
+
+            fn program(&self, name: &str) -> String {
+                self.path(name).to_string_lossy().into_owned()
+            }
+
+            fn write(&self, name: &str, content: &str) {
+                std::fs::write(self.path(name), content).expect("write");
+            }
+
+            fn read(&self, name: &str) -> String {
+                std::fs::read_to_string(self.path(name)).unwrap_or_default()
+            }
+
+            fn keychain(&self) -> Keychain {
+                Keychain::new(self.program("security"), KEYCHAIN_SERVICE)
+            }
+
+            fn stores(&self) -> SecretStores {
+                SecretStores {
+                    op: Some(OnePassword::new(self.program("op"))),
+                    keychain: Some(self.keychain()),
+                }
+            }
+
+            fn assert_no_secret_in_argv(&self) {
+                for log in ["op.argv", "security.argv"] {
+                    assert!(!self.read(log).contains(FAKE), "{log}");
+                }
+            }
+        }
+
+        fn probe(program: &Path) {
+            for _ in 0..200 {
+                match std::process::Command::new(program)
+                    .env("FAKE_PROBE", "1")
+                    .status()
+                {
+                    Ok(_) => return,
+                    Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("cannot run {}: {e}", program.display()),
+                }
+            }
+            panic!("{} stays busy", program.display());
+        }
+
+        fn add_args(name: &str, extra: &[&str]) -> Vec<String> {
+            [
+                "add",
+                "--name",
+                name,
+                "--url",
+                "https://mail.example.com",
+                "--username",
+                "u@example.com",
+                "--yes",
+            ]
+            .iter()
+            .chain(extra)
+            .map(|a| a.to_string())
+            .collect()
+        }
+
+        const KEYCHAIN_STDIN: [&str; 3] = ["--password-source", "keychain", "--password-stdin"];
+
+        fn stdin_script() -> Script {
+            Script::with_stdin(&format!("{FAKE}\n"))
+        }
+
+        fn account_count(path: &Path) -> usize {
+            AppConfig::load_allow_empty(Some(&path.to_path_buf()))
+                .map(|c| c.accounts.len())
+                .unwrap_or(0)
+        }
+
+        #[tokio::test]
+        async fn keychain_add_sends_the_password_on_stdin_only() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            let (result, out) = run_in(
+                &add_args("work", &KEYCHAIN_STDIN),
+                &path,
+                &mut stdin_script(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("add"), "{out}");
+            assert!(out.contains("(keychain)") && !out.contains(FAKE), "{out}");
+            assert_eq!(verifier.calls(), ["work|u@example.com|true"]);
+
+            let stdin = f.read("security.stdin");
+            assert!(
+                stdin.contains(&format!(
+                    r#"add-generic-password -s "stalwart-mcp" -a "work" -w "{FAKE}""#
+                )),
+                "{stdin}"
+            );
+            assert!(!stdin.contains(" -U") && !stdin.contains("-A"), "{stdin}");
+            assert!(f.read("security.argv").lines().any(|l| l == "-i"));
+            f.assert_no_secret_in_argv();
+
+            let config = AppConfig::load(Some(&path)).expect("load");
+            assert_eq!(
+                config.accounts[0].password_command.clone().expect("argv"),
+                f.keychain().password_command("work")
+            );
+            assert!(f.path("item.work").exists());
+        }
+
+        #[tokio::test]
+        async fn keychain_existing_item_needs_force() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            f.write("item.work", "");
+            let (result, _) = run_in(
+                &add_args("work", &KEYCHAIN_STDIN),
+                &path,
+                &mut stdin_script(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            let err = result.expect_err("exists").to_string();
+            assert!(
+                err.contains("already exists") && err.contains("--force"),
+                "{err}"
+            );
+            assert!(!path.exists());
+            assert!(f.read("security.stdin").is_empty());
+            assert!(verifier.calls().is_empty(), "refused before the check");
+
+            let mut args = add_args("work", &KEYCHAIN_STDIN);
+            args.push("--force".into());
+            let (result, out) =
+                run_in(&args, &path, &mut stdin_script(), &verifier, &f.stores()).await;
+            assert!(result.expect("forced"), "{out}");
+            assert!(f.read("security.stdin").contains(" -U -w "));
+            f.assert_no_secret_in_argv();
+
+            // --force never overwrites an item another account reads.
+            let mut doc = ConfigDocument::load_or_new(&path).expect("load");
+            doc.add_account(&AccountEntry {
+                name: "other".into(),
+                url: "https://mail.example.com".into(),
+                username: "o@example.com".into(),
+                password: PasswordSetting::Command(f.keychain().password_command("shared")),
+            })
+            .expect("add");
+            doc.save().expect("save");
+            let mut args = add_args("shared", &KEYCHAIN_STDIN);
+            args.push("--force".into());
+            let (result, _) =
+                run_in(&args, &path, &mut stdin_script(), &verifier, &f.stores()).await;
+            let err = result.expect_err("in use").to_string();
+            assert!(err.contains("password source of account 'other'"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn keychain_failing_final_check_rolls_back() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            f.write("readback", "something-else");
+            let (result, out) = run_in(
+                &add_args("work", &KEYCHAIN_STDIN),
+                &path,
+                &mut stdin_script(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            let err = result.expect_err("final check").to_string();
+            assert!(err.contains("final check"), "{err}");
+            assert!(err.contains("removed again"), "{err}");
+            assert!(!err.contains(FAKE) && !out.contains(FAKE), "{err}");
+            assert!(!f.path("item.work").exists());
+            assert!(
+                f.read("security.argv")
+                    .lines()
+                    .any(|l| l == "delete-generic-password -s stalwart-mcp -a work")
+            );
+            assert_eq!(account_count(&path), 0);
+
+            // A failing rollback names the item to remove by hand.
+            f.write("security-fail-delete", "");
+            let (_d2, path2) = temp_config();
+            let (result, _) = run_in(
+                &add_args("work", &KEYCHAIN_STDIN),
+                &path2,
+                &mut stdin_script(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            let err = result.expect_err("final check").to_string();
+            assert!(
+                err.contains("service 'stalwart-mcp', account 'work'") && err.contains("by hand"),
+                "{err}"
+            );
+            assert!(err.contains("security delete-generic-password"), "{err}");
+            assert_eq!(account_count(&path2), 0);
+        }
+
+        #[tokio::test]
+        async fn keychain_refuses_line_breaks() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            for typed in ["a\rb", "a\nb"] {
+                let (result, _) = run_in(
+                    &add_args("work", &KEYCHAIN_STDIN),
+                    &path,
+                    &mut Script::with_stdin(typed),
+                    &verifier,
+                    &f.stores(),
+                )
+                .await;
+                let err = result.expect_err("refused").to_string();
+                assert!(err.contains("line break"), "{err}");
+            }
+            // Typed on the terminal, too.
+            let mut script = Script::answering(&["x\ny"]);
+            let (result, _) = run_in(
+                &add_args("work", &["--password-source", "keychain"]),
+                &path,
+                &mut script,
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(
+                result
+                    .expect_err("refused")
+                    .to_string()
+                    .contains("line break")
+            );
+            assert!(f.read("security.argv").is_empty());
+            assert!(!path.exists());
+        }
+
+        #[tokio::test]
+        async fn remove_deletes_only_the_item_named_by_the_argv() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            for name in ["work", "keep"] {
+                let (result, out) = run_in(
+                    &add_args(name, &KEYCHAIN_STDIN),
+                    &path,
+                    &mut stdin_script(),
+                    &verifier,
+                    &f.stores(),
+                )
+                .await;
+                assert!(result.expect("add"), "{out}");
+            }
+            let remove = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+
+            let (result, out) = run_in(
+                &remove(&["remove", "work", "--yes", "--delete-secret"]),
+                &path,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("remove"), "{out}");
+            assert!(out.contains("Deleted the Keychain item"), "{out}");
+            assert!(!f.path("item.work").exists());
+            assert!(f.path("item.keep").exists());
+            let deletes: Vec<String> = f
+                .read("security.argv")
+                .lines()
+                .filter(|l| l.starts_with("delete-generic-password"))
+                .map(str::to_string)
+                .collect();
+            assert_eq!(deletes, ["delete-generic-password -s stalwart-mcp -a work"]);
+
+            // --yes without --delete-secret keeps the item and says how to delete it.
+            let (result, out) = run_in(
+                &remove(&["remove", "keep", "--yes"]),
+                &path,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("remove"), "{out}");
+            assert!(out.contains("Kept the Keychain item"), "{out}");
+            assert!(f.path("item.keep").exists());
+
+            // The item comes from the argv's -a, not from the account name; a
+            // foreign service is never touched.
+            let mut doc = ConfigDocument::load_or_new(&path).expect("load");
+            let entry = |name: &str, argv: Vec<String>| AccountEntry {
+                name: name.into(),
+                url: "https://mail.example.com".into(),
+                username: "x@example.com".into(),
+                password: PasswordSetting::Command(argv),
+            };
+            doc.add_account(&entry("byargv", f.keychain().password_command("keep")))
+                .expect("add");
+            let foreign = Keychain::new(f.program("security"), "someone-else");
+            doc.add_account(&entry("foreign", foreign.password_command("foreign")))
+                .expect("add");
+            doc.save().expect("save");
+            f.write("item.foreign", "");
+
+            let (result, _) = run_in(
+                &remove(&["remove", "foreign", "--yes", "--delete-secret"]),
+                &path,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            let err = result.expect_err("foreign").to_string();
+            assert!(err.contains("not exactly the Keychain command"), "{err}");
+            assert!(f.path("item.foreign").exists());
+
+            // Interactive: the prompt decides.
+            let mut script = Script::answering(&["y", "y"]);
+            let (result, out) = run_in(
+                &remove(&["remove", "byargv"]),
+                &path,
+                &mut script,
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("remove"), "{out}");
+            assert!(
+                script.questions[1].contains("account 'keep'"),
+                "{:?}",
+                script.questions
+            );
+            assert!(!f.path("item.keep").exists());
+            let deletes = f
+                .read("security.argv")
+                .lines()
+                .filter(|l| l.starts_with("delete-generic-password"))
+                .count();
+            assert_eq!(deletes, 2);
+        }
+
+        #[tokio::test]
+        async fn rename_moves_the_keychain_item() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            let (result, out) = run_in(
+                &add_args("work", &KEYCHAIN_STDIN),
+                &path,
+                &mut stdin_script(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("add"), "{out}");
+
+            // A name whose item exists is refused and nothing changes.
+            f.write("item.taken", "");
+            let before = std::fs::read_to_string(&path).expect("read");
+            let args: Vec<String> = ["edit", "work", "--rename", "taken", "--yes"]
+                .map(String::from)
+                .to_vec();
+            let (result, _) =
+                run_in(&args, &path, &mut Script::offline(), &verifier, &f.stores()).await;
+            assert!(result.expect_err("taken").to_string().contains("--force"));
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+            assert!(f.path("item.work").exists());
+
+            let calls = verifier.calls().len();
+            let args: Vec<String> = ["edit", "work", "--rename", "main", "--yes"]
+                .map(String::from)
+                .to_vec();
+            let (result, out) =
+                run_in(&args, &path, &mut Script::offline(), &verifier, &f.stores()).await;
+            assert!(result.expect("rename"), "{out}");
+            assert!(out.contains("Moved the Keychain item"), "{out}");
+            assert_eq!(verifier.calls().len(), calls, "a rename does not re-verify");
+            assert!(f.path("item.main").exists());
+            assert!(!f.path("item.work").exists());
+            let config = AppConfig::load(Some(&path)).expect("load");
+            assert_eq!(config.accounts[0].name, "main");
+            assert_eq!(
+                config.accounts[0].password_command.clone().expect("argv"),
+                f.keychain().password_command("main")
+            );
+            f.assert_no_secret_in_argv();
+        }
+
+        #[tokio::test]
+        async fn onepassword_reference_mode_stores_ids() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            let (result, out) = run_in(
+                &add_args(
+                    "work",
+                    &[
+                        "--password-source",
+                        "1password",
+                        "--op-reference",
+                        "op://Private/Mail work/password",
+                    ],
+                ),
+                &path,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("add"), "{out}");
+            assert!(out.contains("(1password)"), "{out}");
+            assert_eq!(verifier.calls(), ["work|u@example.com|true"]);
+            let argv = f.read("op.argv");
+            assert!(
+                argv.lines().any(|l| l == "account list --format json"),
+                "{argv}"
+            );
+            assert!(
+                argv.lines().any(|l| l
+                    == "item get Mail work --vault Private --account ACCOUNTUUID1 --format json"),
+                "{argv}"
+            );
+            let config = AppConfig::load(Some(&path)).expect("load");
+            assert_eq!(
+                config.accounts[0].password_command.clone().expect("argv"),
+                [
+                    f.program("op").as_str(),
+                    "read",
+                    "-n",
+                    "--account",
+                    "ACCOUNTUUID1",
+                    "op://vaultid1/itemid1/password"
+                ]
+            );
+            f.assert_no_secret_in_argv();
+            assert!(f.read("op.stdin").is_empty());
+
+            // Without a reference or a vault and no terminal, the flags are named.
+            let (_d2, path2) = temp_config();
+            let (result, _) = run_in(
+                &add_args("work", &["--password-source", "1password"]),
+                &path2,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            let err = result.expect_err("missing").to_string();
+            assert!(
+                err.contains("--op-reference") && err.contains("--op-vault"),
+                "{err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn onepassword_offers_items_matching_the_mail_host() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            f.write(
+                "op.item",
+                r#"{"id":"titleitem","vault":{"id":"vaultid2","name":"Work"},"fields":[{"id":"password","label":"password"}]}"#,
+            );
+            let mut script = Script::answering(&["existing", "2", "y"]);
+            let (result, out) = run_in(
+                &add_args("work", &["--password-source", "1password"])
+                    .into_iter()
+                    .filter(|a| a != "--yes")
+                    .collect::<Vec<_>>(),
+                &path,
+                &mut script,
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("add"), "{out}");
+            let list = &script.questions[1];
+            assert!(list.contains("1) Mail (vault Private)"), "{list}");
+            assert!(
+                list.contains("2) mail.example.com login (vault Work)"),
+                "{list}"
+            );
+            assert!(!list.contains("Other"), "{list}");
+            assert!(
+                f.read("op.argv").lines().any(|l| l
+                    == "item get titleitem --vault vaultid2 --account ACCOUNTUUID1 --format json")
+            );
+            let config = AppConfig::load(Some(&path)).expect("load");
+            let argv = config.accounts[0].password_command.clone().expect("argv");
+            assert_eq!(argv[5], "op://vaultid2/titleitem/password");
+        }
+
+        #[tokio::test]
+        async fn onepassword_create_sends_the_template_on_stdin() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            let (result, out) = run_in(
+                &add_args("work", &["--op-vault", "Private", "--password-stdin"]),
+                &path,
+                &mut stdin_script(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("add"), "{out}");
+            let template: serde_json::Value =
+                serde_json::from_str(&f.read("op.stdin")).expect("json template");
+            assert_eq!(template["title"], "stalwart-mcp work");
+            assert_eq!(template["category"], "LOGIN");
+            assert_eq!(template["fields"][0]["value"], "u@example.com");
+            assert_eq!(template["fields"][1]["id"], "password");
+            assert_eq!(template["fields"][1]["type"], "CONCEALED");
+            assert_eq!(template["fields"][1]["value"], FAKE);
+            assert!(f.read("op.argv").lines().any(|l| l
+                == "item create --vault Private --account ACCOUNTUUID1 --url \
+                    https://mail.example.com --format json -"));
+            f.assert_no_secret_in_argv();
+            let config = AppConfig::load(Some(&path)).expect("load");
+            let argv = config.accounts[0].password_command.clone().expect("argv");
+            assert_eq!(argv[5], "op://vaultid1/newitem1/password");
+        }
+
+        #[tokio::test]
+        async fn onepassword_create_rolls_back_and_names_the_item_when_that_fails() {
+            let f = Fakes::new();
+            let verifier = FakeVerifier::default();
+            f.write("readback", "something-else");
+            let args = add_args("work", &["--op-vault", "Private", "--password-stdin"]);
+
+            let (_d, path) = temp_config();
+            let (result, _) =
+                run_in(&args, &path, &mut stdin_script(), &verifier, &f.stores()).await;
+            let err = result.expect_err("final check").to_string();
+            assert!(
+                err.contains("final check") && err.contains("removed again"),
+                "{err}"
+            );
+            assert!(
+                f.read("op.argv")
+                    .lines()
+                    .any(|l| l == "item delete newitem1 --vault vaultid1 --account ACCOUNTUUID1")
+            );
+            assert_eq!(account_count(&path), 0);
+
+            f.write("op-fail-delete", "");
+            let (_d2, path2) = temp_config();
+            let (result, _) =
+                run_in(&args, &path2, &mut stdin_script(), &verifier, &f.stores()).await;
+            let err = result.expect_err("final check").to_string();
+            assert!(
+                err.contains("1Password item newitem1 in vault vaultid1")
+                    && err.contains("by hand"),
+                "{err}"
+            );
+            assert!(!err.contains(FAKE), "{err}");
+            assert_eq!(account_count(&path2), 0);
+            f.assert_no_secret_in_argv();
+        }
+
+        #[tokio::test]
+        async fn the_suggested_source_follows_what_is_available() {
+            let f = Fakes::new();
+            let mut script = Script::answering(&[""]);
+            let kind = ask_source_kind(&f.stores(), &mut script)
+                .await
+                .expect("ask");
+            assert_eq!(kind, SourceKind::OnePassword);
+            assert_eq!(script.defaults[0].as_deref(), Some("1password"));
+            assert!(
+                script.questions[0].contains("1password, keychain, env, command"),
+                "{:?}",
+                script.questions
+            );
+
+            // `op` without an account is not offered.
+            f.write("op.accounts", "[]");
+            let mut script = Script::answering(&[""]);
+            let kind = ask_source_kind(&f.stores(), &mut script)
+                .await
+                .expect("ask");
+            assert_eq!(kind, SourceKind::Keychain);
+            assert!(!script.questions[0].contains("1password"));
+
+            let mut script = Script::answering(&[""]);
+            let kind = ask_source_kind(&SecretStores::default(), &mut script)
+                .await
+                .expect("ask");
+            assert_eq!(kind, SourceKind::Env);
+            assert_eq!(script.questions[0], "Password source (env, command)");
+
+            // Never chosen without a terminal, even when 1Password is there.
+            f.write(
+                "op.accounts",
+                r#"[{"url":"my.1password.com","account_uuid":"ACCOUNTUUID1"}]"#,
+            );
+            let err = ask_source_kind(&f.stores(), &mut Script::offline())
+                .await
+                .expect_err("no terminal")
+                .to_string();
+            assert!(err.contains("--password-source"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn keychain_service_override_is_limited_to_stalwart_mcp_names() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            let mut args = add_args("work", &KEYCHAIN_STDIN);
+            args.extend(["--keychain-service".into(), "stalwart-mcp-test".into()]);
+            let (result, out) =
+                run_in(&args, &path, &mut stdin_script(), &verifier, &f.stores()).await;
+            assert!(result.expect("add"), "{out}");
+            assert!(
+                f.read("security.stdin")
+                    .contains(r#"-s "stalwart-mcp-test""#)
+            );
+            let config = AppConfig::load(Some(&path)).expect("load");
+            let argv = config.accounts[0].password_command.clone().expect("argv");
+            assert_eq!(argv[3], "stalwart-mcp-test");
+
+            // Without the override the item is not recognised as ours.
+            let remove: Vec<String> = ["remove", "work", "--yes", "--delete-secret"]
+                .map(String::from)
+                .to_vec();
+            let (result, _) = run_in(
+                &remove,
+                &path,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.is_err());
+            let mut remove = remove;
+            remove.extend(["--keychain-service".into(), "stalwart-mcp-test".into()]);
+            let (result, out) = run_in(
+                &remove,
+                &path,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("remove"), "{out}");
+            assert!(!f.path("item.work").exists());
+
+            for bad in ["login", "stalwart-mcp-", "stalwart-mcp-a b", "Stalwart-mcp"] {
+                assert!(
+                    with_keychain_service(&f.stores(), Some(bad)).is_err(),
+                    "{bad}"
+                );
+            }
+        }
     }
 }

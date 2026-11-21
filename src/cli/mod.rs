@@ -104,6 +104,8 @@ pub trait Prompter {
     fn ask(&mut self, question: &str, default: Option<&str>) -> Result<String, CliError>;
     /// Ask for a secret without echoing it.
     fn ask_secret(&mut self, question: &str) -> Result<Secret, CliError>;
+    /// Read the password from stdin (`--password-stdin`).
+    fn read_password_stdin(&mut self) -> Result<Secret, CliError>;
     /// Ask a yes/no question; the default is no.
     fn confirm(&mut self, question: &str) -> Result<bool, CliError>;
 }
@@ -160,6 +162,20 @@ impl Prompter for TerminalPrompter {
         rpassword::prompt_password(format!("{question}: "))
             .map(Secret::new)
             .map_err(input_error)
+    }
+
+    fn read_password_stdin(&mut self) -> Result<Secret, CliError> {
+        use std::io::Read;
+        // One byte over the limit (plus a line break) so an oversized
+        // password is refused rather than cut.
+        let limit = crate::secret::MAX_PASSWORD_OUTPUT as u64 + 3;
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .lock()
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(input_error)?;
+        crate::secret_store::password_from_stdin(bytes).map_err(|e| CliError::Usage(e.to_string()))
     }
 
     fn confirm(&mut self, question: &str) -> Result<bool, CliError> {

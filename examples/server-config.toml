@@ -19,11 +19,24 @@ username = "user@example.com"
 # and so must its directory (chmod 600 on the file, chmod 700 on the directory).
 # Not checked on Windows. Accounts are only read from this file, never from
 # STALWART_MCP_* environment variables.
+#
+# `stalwart-mcp account add --password-source keychain` (macOS) stores the
+# password in the Keychain and writes this; any process running as you can read
+# such an item:
 # [[accounts]]
 # name = "keychain"
 # url = "https://mail.example.com"
 # username = "me@example.com"
 # password_command = ["/usr/bin/security", "find-generic-password", "-s", "stalwart-mcp", "-a", "keychain", "-w"]
+#
+# `stalwart-mcp account add --password-source 1password` writes this, with the
+# absolute path of op and ids instead of names (1Password asks for Touch ID
+# when the server starts and the app is locked):
+# [[accounts]]
+# name = "onepassword"
+# url = "https://mail.example.com"
+# username = "me@example.com"
+# password_command = ["/opt/homebrew/bin/op", "read", "-n", "--account", "<account id>", "op://<vault id>/<item id>/password"]
 
 # Optional: first account is used as default if omitted
 # default_account = "personal"

@@ -8,3 +8,4 @@ pub mod mcp;
 pub mod notifications;
 pub mod rate_limit;
 pub mod secret;
+pub mod secret_store;
