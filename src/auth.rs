@@ -1,7 +1,7 @@
 use crate::mcp::authz::AuthContext;
 use axum::{
     extract::ConnectInfo,
-    http::{Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode},
     middleware::Next,
     response::Response,
 };
@@ -91,6 +91,16 @@ pub async fn auth_middleware(
     // an HTTP request without one.
     // A configured secret also protects requests from a local reverse proxy.
     if addr.ip().is_loopback() && secret.0.is_empty() {
+        // A request a reverse proxy forwarded is not a local client, even though
+        // the TCP peer is loopback. A proxy that strips these headers is still
+        // trusted, so a secret stays mandatory behind any proxy.
+        if is_forwarded(request.headers()) {
+            tracing::warn!(
+                addr = %addr,
+                "Forwarded request rejected: no auth.secret configured; set auth.secret to serve behind a reverse proxy"
+            );
+            return Err(StatusCode::UNAUTHORIZED);
+        }
         request.extensions_mut().insert(AuthContext::unrestricted());
         return Ok(next.run(request).await);
     }
@@ -125,6 +135,46 @@ pub async fn auth_middleware(
     }
 }
 
+/// Headers a reverse proxy adds to say the request came from somewhere else.
+const FORWARDING_HEADERS: [&str; 3] = ["forwarded", "x-forwarded-for", "x-real-ip"];
+
+/// True when the request carries any proxy forwarding header, whatever its
+/// value (even empty). `HeaderMap` lookups are case-insensitive.
+pub fn is_forwarded(headers: &HeaderMap) -> bool {
+    FORWARDING_HEADERS
+        .iter()
+        .any(|name| headers.contains_key(*name))
+}
+
 /// Wrapper to pass the JWT secret through request extensions
 #[derive(Clone)]
 pub struct AuthSecret(pub String);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn forwarding_headers_are_detected() {
+        assert!(!is_forwarded(&HeaderMap::new()));
+        for name in [
+            "Forwarded",
+            "X-Forwarded-For",
+            "x-real-ip",
+            "X-REAL-IP",
+            "x-forwarded-for",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_static(""),
+            );
+            assert!(is_forwarded(&headers), "{name}");
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-host", HeaderValue::from_static("a"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        assert!(!is_forwarded(&headers));
+    }
+}

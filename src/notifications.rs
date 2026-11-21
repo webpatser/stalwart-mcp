@@ -81,9 +81,9 @@ pub async fn listen(accounts: Arc<AccountManager>, peer: Peer<RoleServer>, ping_
                         );
 
                         let notification = ServerNotification::ResourceUpdatedNotification(
-                            Notification::new(ResourceUpdatedNotificationParam::new(format!(
-                                "stalwart://inbox/{account_name}"
-                            ))),
+                            Notification::new(ResourceUpdatedNotificationParam::new(
+                                folders_uri(&account_name),
+                            )),
                         );
 
                         if let Err(e) = peer.send_notification(notification).await {
@@ -99,5 +99,27 @@ pub async fn listen(accounts: Arc<AccountManager>, peer: Peer<RoleServer>, ping_
 
             tracing::info!(account = %account_name, "EventSource listener stopped");
         });
+    }
+}
+
+/// URI of the declared `mail://{account}/folders` resource, the one a mail
+/// change updates (folder counts), so subscribers of that resource match.
+fn folders_uri(account: &str) -> String {
+    format!("mail://{account}/folders")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcp::resources::{ResourceMatch, match_resource_uri};
+
+    #[test]
+    fn notification_uri_matches_the_folders_resource() {
+        let uri = folders_uri("work");
+        assert_eq!(uri, "mail://work/folders");
+        assert!(matches!(
+            match_resource_uri(&uri),
+            Some(ResourceMatch::Folders { account: "work" })
+        ));
     }
 }

@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.1-3] - Unreleased
+## [1.1.1-3] - 2026-11-21
 
 ### Security
 - **Behaviour change:** JWT scopes and the `--account` restriction are now enforced (#3). Before, the claims were validated and then ignored, so any valid token could modify, send and reach every account. Every tool call and resource read is now checked at one point before it runs: read tools need `mail:read`; `mail_flag`, `mail_move`, `mail_draft`, `mail_bulk_read`, `mail_bulk_junk`, `mail_bulk_delete`, `mail_masked_create`, `mail_masked_disable` and `spam_train` need `mail:modify`; `mail_send` and `mail_vacation_set` need `mail:send`. Tokens created with the default `mail:read` lose write access; re-issue them with the scopes they need.
@@ -8,6 +8,15 @@
 - An HTTP request that reaches the MCP handler without an authorization context is refused (fail closed). Stdio and secret-less loopback HTTP stay unrestricted.
 - `token create` rejects unknown scope strings; accepted are `mail:read`, `mail:modify`, `mail:send` and `*`.
 - **Behaviour change:** `mail_bulk_delete` no longer destroys mail by default (#4). It now moves the emails to the Trash mailbox (resolved by its `trash` role, else a folder named "Trash") and reports how many the server actually moved; without a Trash mailbox it fails and deletes nothing. Permanent destruction needs the new `permanent: true` argument and the new `capabilities.delete = true` (default false); the capability is checked before any request reaches the mail server.
+- Without `auth.secret`, a loopback HTTP request that carries a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header is now rejected with 401 and a warning naming `auth.secret`: a request a reverse proxy forwarded is not a local client. A proxy that strips those headers is still trusted, so set `auth.secret` behind any proxy.
+
+### Fixed
+- Resource update notifications now name `mail://{account}/folders`, the declared resource, instead of `stalwart://inbox/{account}`, which matched nothing a client could subscribe to.
+- The non-localhost warning at HTTP startup now also fires for an empty `auth.secret`.
+
+### Changed
+- Removed axum's `DefaultBodyLimit` layer, which never applied because no axum extractor reads the body. The 2 MB request limit is enforced by the MCP transport itself (413), now covered by a test.
+- New `scripts/e2e.py`: an end-to-end MCP client for an installed binary against a live Stalwart. It sends no mail unless `--send` is given, cleans up what it creates, and reads all credentials from the environment.
 
 ## [1.1.1-2] - 2026-11-20
 

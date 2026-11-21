@@ -167,18 +167,14 @@ async fn serve_http(
 ) -> anyhow::Result<()> {
     let is_localhost = addr.starts_with("127.0.0.1") || addr.starts_with("localhost");
 
-    if !is_localhost && auth_config.secret.is_none() {
+    if !is_localhost && !auth_config.has_secret() {
         tracing::warn!(
             addr = %addr,
             "HTTP mode bound to non-localhost WITHOUT auth.secret configured. Remote requests will be rejected!"
         );
     }
 
-    if auth_config
-        .secret
-        .as_ref()
-        .is_some_and(|secret| !secret.is_empty())
-    {
+    if auth_config.has_secret() {
         tracing::info!(addr = %addr, "Starting MCP server on HTTP (JWT required for all requests)");
     } else if !is_localhost {
         tracing::info!(addr = %addr, "Starting MCP server on HTTP (JWT required for remote)");
@@ -205,15 +201,15 @@ fn http_router(
     auth_config: &stalwart_mcp::config::AuthConfig,
     server_config: &stalwart_mcp::config::ServerConfig,
 ) -> axum::Router {
-    use axum::{Router, extract::DefaultBodyLimit};
+    use axum::Router;
     use rmcp::transport::streamable_http_server::{
         StreamableHttpService, session::local::LocalSessionManager,
     };
     use stalwart_mcp::auth::AuthSecret;
     use std::sync::Arc;
 
-    // Request bodies are capped at 2 MB. `DefaultBodyLimit` only governs axum extractors,
-    // and the rmcp service reads the body itself, so its own limit is set to match.
+    // Request bodies are capped at 2 MB. The rmcp service reads the POST body itself
+    // and answers 413 past this limit; no axum extractor reads it, so no axum limit.
     const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 
     let mut transport_config =
@@ -234,7 +230,6 @@ fn http_router(
 
     Router::new()
         .nest_service("/mcp", service)
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .layer(axum::middleware::from_fn(
             stalwart_mcp::auth::auth_middleware,
         ))
@@ -450,6 +445,80 @@ mod http_tests {
                 StatusCode::OK
             );
         }
+    }
+
+    #[tokio::test]
+    async fn forwarded_requests_need_a_secret() {
+        let open = test_router("", vec![]);
+        let cases: Vec<(Vec<(&str, &str)>, StatusCode)> = vec![
+            (vec![], StatusCode::OK),
+            (vec![("x-forwarded-proto", "https")], StatusCode::OK),
+            (
+                vec![("Forwarded", "for=198.51.100.7")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![("forwarded", "for=198.51.100.7")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![("X-Forwarded-For", "198.51.100.7")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![("x-FORWARDED-for", "198.51.100.7")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![("X-Real-IP", "198.51.100.7")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (vec![("x-real-ip", "")], StatusCode::UNAUTHORIZED),
+            (
+                vec![("x-real-ip", "127.0.0.1"), ("X-Real-Ip", "198.51.100.7")],
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                vec![
+                    ("x-forwarded-for", "127.0.0.1"),
+                    ("X-Forwarded-For", "198.51.100.7"),
+                ],
+                StatusCode::UNAUTHORIZED,
+            ),
+        ];
+        for (headers, expected) in &cases {
+            let response = send(&open, true, None, "localhost", headers, INITIALIZE).await;
+            assert_eq!(response.status(), *expected, "{headers:?}");
+        }
+
+        // With a secret the proxied request is authenticated by its token instead.
+        let secret = "test-secret-used-only-in-tests";
+        let valid = stalwart_mcp::auth::create_token(secret, "*", &["*".into()], 1).unwrap();
+        let with_secret = test_router(secret, vec![]);
+        let headers = [("X-Forwarded-For", "198.51.100.7")];
+        for (token, expected) in [
+            (Some(valid.as_str()), StatusCode::OK),
+            (None, StatusCode::UNAUTHORIZED),
+        ] {
+            let response = send(&with_secret, true, token, "localhost", &headers, INITIALIZE).await;
+            assert_eq!(response.status(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_is_capped_at_two_megabytes() {
+        // rmcp's own default is 4 MB, so a 413 between 2 and 4 MB proves our limit.
+        const LIMIT: usize = 2 * 1024 * 1024;
+        let router = test_router("", vec![]);
+        let padded = |len: usize| format!("{INITIALIZE}{}", " ".repeat(len - INITIALIZE.len()));
+
+        let at_limit = send(&router, true, None, "localhost", &[], &padded(LIMIT)).await;
+        assert_eq!(at_limit.status(), StatusCode::OK);
+        let over = send(&router, true, None, "localhost", &[], &padded(LIMIT + 1)).await;
+        assert_eq!(over.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let well_over = padded(3 * 1024 * 1024);
+        let response = send(&router, true, None, "localhost", &[], &well_over).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]

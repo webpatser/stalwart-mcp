@@ -82,6 +82,7 @@ To pick a build for your server, take the newest tag whose first three numbers a
 | `1.0.3-1`    | 1.0.3    |
 | `1.1.1-1`    | 1.1.1    |
 | `1.1.1-2`    | 1.1.1    |
+| `1.1.1-3`    | 1.1.1    |
 
 Test coverage for `1.0.3-1`: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3.
 
@@ -253,7 +254,7 @@ Then configure your client to connect via HTTP:
 }
 ```
 
-**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, every request arriving from loopback is trusted and all others are rejected. A reverse proxy on the same host makes every request arrive from loopback, so without a secret it exposes the server unauthenticated. HTTP mode refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty, but it cannot detect a proxy: with `allowed_hosts` unset, a proxy that forwards a loopback Host (nginx `proxy_pass http://127.0.0.1:3000` does by default) still gets through. Always set `auth.secret` when the server sits behind a reverse proxy or is reachable by anything other than local clients. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
+**Note:** With `auth.secret` configured, every HTTP request requires a valid JWT, including loopback requests from a reverse proxy. Without a secret, a request arriving from loopback is trusted and all others are rejected. A reverse proxy on the same host makes every request arrive from loopback, so without a secret, a loopback request that carries a `Forwarded`, `X-Forwarded-For` or `X-Real-IP` header (any value, any casing) is rejected with 401 and a warning naming `auth.secret`. This closes the common case of an nginx or caddy setup that adds those headers. It cannot detect a proxy that strips them or never sets them: such a proxy (nginx `proxy_pass http://127.0.0.1:3000` without `proxy_set_header`, which also forwards a loopback Host by default) still gets through unauthenticated. HTTP mode also refuses to start when `server.allowed_hosts` is set and `auth.secret` is empty. Always set `auth.secret` when the server sits behind a reverse proxy or is reachable by anything other than local clients. TLS should be handled by a reverse proxy (nginx, caddy) or Stalwart's own TLS.
 
 ## Example interactions
 
@@ -309,6 +310,24 @@ The send test (`test_send_email` in `tests/integration_mail.rs`) sends one real 
 export STALWART_TEST_SEND_TO="someone-who-agreed@example.com"
 cargo test --locked --test integration_mail test_send_email -- --ignored --nocapture
 ```
+
+### End-to-end script
+
+`scripts/e2e.py` drives an installed `stalwart-mcp` binary as an MCP client, over stdio and streamable HTTP, against a live Stalwart. It needs only the Python 3 standard library.
+
+```bash
+cargo install --path . --locked
+export STALWART_TEST_URL="https://mail.example.com"
+export STALWART_TEST_USER="user@example.com"
+export STALWART_PASSWORD="your-password"
+python3 -I scripts/e2e.py
+```
+
+It covers the initialize handshake and version, tools, prompts and resources; every read tool; the draft lifecycle (flags, move, bulk read, both `mail_bulk_delete` modes); masked email create, disable and destroy; a disabled vacation response with restore; capability gates; and over HTTP: JWT required, tampered token and foreign Host refused, a read-only token refused on `mail_draft`, an account-restricted token refused another account, a forwarded request refused without a secret, and a body over 2 MB answered with 413.
+
+It works on what it creates and removes it: its draft, its masked address, the disabled vacation response (restored to the prior one) and the inactive Sieve script that write leaves behind, then checks that nothing is left and prints a `CLEANUP` line per item. It skips the vacation write when an auto-reply is active and never trains the spam filter. Config files and logs go to a private temporary directory that is deleted at the end. Output never contains the credentials, and email local parts are redacted.
+
+By default it sends no mail. `--send` sends one plain-text message to `STALWART_TEST_SEND_TO` and leaves its Sent copy in place. Other options: `--bin` (binary path, default `~/.cargo/bin/stalwart-mcp`), `--port` (HTTP test port, default 38766), `--keep-logs`.
 
 ## Architecture
 
