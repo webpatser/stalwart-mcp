@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod config;
+pub mod config_edit;
 pub mod error;
 pub mod jmap;
 pub mod mcp;
