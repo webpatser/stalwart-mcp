@@ -27,7 +27,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail_bulk_read` | Bulk mark emails as read in a single JMAP request |
 | `mail_draft` | Save draft in Drafts folder |
 | `mail_send` | Send email (requires `capabilities.send = true` in config) |
-| `spam_train` | Train Stalwart's Bayes classifier via JMAP `SpamTrainingSample/set` (requires Stalwart v0.16+ and `capabilities.spam_training = true`) |
+| `spam_train` | Train Stalwart's Bayes classifier via JMAP `x:SpamTrainingSample/set` (requires Stalwart v0.16+ and `capabilities.spam_training = true`) |
 
 ### Account
 
@@ -96,7 +96,9 @@ Test coverage for `1.0.3-1`: the HTTP transport, auth and the Sent/Drafts mailbo
 
 Test coverage for `1.1.1-1`, run live against Stalwart 1.1.1 (`tests/integration_mail.rs` and `tests/integration_account.rs`): connect and session capabilities; mailbox listing and role lookup; recent listing, search, full message, raw blob and Message-ID reads; the draft lifecycle (create, search, read/unread, both `mail_bulk_delete` modes: bulk move to Trash, then permanent delete); masked email list, create, disable and destroy; vacation response get, set (disabled only) and restore; `Quota/get` (on an account without a disk quota, so an empty list) and `Identity/get`; `mail_send` (`Email/set` plus `EmailSubmission/set`, one real message, with the fixes from `1.1.1-2`).
 
-Test coverage for `1.1.1-2`: every tool except `spam_train` (`SpamTrainingSample/set`) has now been run live against Stalwart 1.1.1, including `mail_send` and a draft whose From is the identity's address. Paths not exercised live: an enabled vacation response and the masked address quota error.
+Test coverage for `1.1.1-2`: every tool except `spam_train` and `mail_bulk_junk` has now been run live against Stalwart 1.1.1, including `mail_send` and a draft whose From is the identity's address. Paths not exercised live: an enabled vacation response and the masked address quota error.
+
+Test coverage for `1.1.1-4`, run live against Stalwart 1.1.1, once each: `mail_bulk_junk`'s JMAP path (`test_bulk_junk`) passed: a draft was moved into Junk with `$junk` and back to Drafts, the server stored one training sample per move, and the test destroyed both, the draft, and confirmed the sample count was back to its prior value. `spam_train` (`test_spam_training`) reached the server with the corrected `x:SpamTrainingSample/set` call, which Stalwart refused with `forbidden` ("You are not authorized to create objects of this type") for a plain user account; nothing was created and the draft was removed. A successful `spam_train` has not been run live: it needs an account with the permission to create spam training samples, and the clearer error for this refusal was added after the run and is covered by unit tests only.
 
 ## Installation
 
@@ -129,7 +131,7 @@ password_env = "STALWART_PASSWORD_WORK"
 [capabilities]
 # Allow sending emails (default: false)
 # send = true
-# Allow spam training via JMAP SpamTrainingSample/set (default: false, requires Stalwart v0.16+)
+# Allow spam training via JMAP x:SpamTrainingSample/set (default: false, requires Stalwart v0.16+)
 # spam_training = true
 # Allow creating and disabling masked email addresses (default: false, requires Stalwart 1.1+).
 # Listing them is always allowed.
@@ -315,6 +317,8 @@ cargo test --locked -- --ignored --test-threads=1
 ```
 
 The account tests (`tests/integration_account.rs`) write to the account and restore it: they create, disable and destroy one masked address, and set a disabled vacation response before putting the prior one back. They skip the vacation write when an auto-reply is active.
+
+`test_spam_training` and `test_bulk_junk` only run with `STALWART_TEST_SPAM_TRAIN=1`, because they feed the account's spam classifier. Each creates its own draft: the first trains it once through `x:SpamTrainingSample/set`, the second moves it into Junk and back through the `mail_bulk_junk` path (Stalwart stores a training sample on each of those moves). Both then destroy exactly the samples they caused and the draft, and check the sample count is back. Destroying a sample does not undo training the classifier has already done from it.
 
 The send test (`test_send_email` in `tests/integration_mail.rs`) sends one real plain-text message per run and is skipped unless `STALWART_TEST_SEND_TO` names the recipient; it checks that the copy lands in Sent without `$draft` and with the identity's address as From, then removes that copy. Keep the address in your environment, never in the repo:
 

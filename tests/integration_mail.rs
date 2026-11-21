@@ -8,8 +8,11 @@
 //! Optional:
 //! - STALWART_TEST_ADDRESS: mail address of the test user, used as From and To
 //!   of the self-addressed drafts (defaults to STALWART_TEST_USER)
-//! - STALWART_TEST_SPAM_TRAIN=1: also run the spam training test, which
-//!   changes the server's spam model
+//! - STALWART_TEST_SPAM_TRAIN=1: also run `test_spam_training` and
+//!   `test_bulk_junk`. Both create training samples on the server (the first
+//!   one by `SpamTrainingSample/set`, the second because Stalwart trains on a
+//!   move into and out of Junk) and destroy exactly the samples they caused.
+//!   Destroying a sample does not undo training the classifier already did.
 //! - STALWART_TEST_SEND_TO: the one address `test_send_email` may send a real
 //!   message to (one plain-text message per run, no cc or bcc). Without it
 //!   the send test is skipped. Never commit the address.
@@ -21,10 +24,13 @@
 //!
 //! Run with: cargo test --test integration_mail -- --ignored --nocapture
 
+use serde_json::json;
 use stalwart_mcp::config::AccountConfig;
 use stalwart_mcp::error::AppError;
 use stalwart_mcp::jmap::JmapClient;
 use stalwart_mcp::jmap::mail::{ComposeEmail, SearchFilters};
+use stalwart_mcp::jmap::raw::RawJmap;
+use std::collections::HashSet;
 use std::time::Duration;
 
 fn test_config() -> Option<AccountConfig> {
@@ -698,12 +704,196 @@ async fn sent_checks(
     Ok(())
 }
 
-/// SpamTrainingSample/set via a self-created draft. Changes the spam model, so
-/// it only runs with STALWART_TEST_SPAM_TRAIN=1.
+/// Capabilities and methods of Stalwart's spam training samples. They are
+/// registry objects, which Stalwart 1.1.1 dispatches only under the `x:` prefix.
+const SAMPLE_USING: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"];
+const SAMPLE_QUERY: &str = "x:SpamTrainingSample/query";
+const SAMPLE_GET: &str = "x:SpamTrainingSample/get";
+const SAMPLE_SET: &str = "x:SpamTrainingSample/set";
+/// Requested `/query` page size; the server may cap it lower.
+const SAMPLE_PAGE: usize = 256;
+const SAMPLE_MAX_PAGES: usize = 10_000;
+/// Ids per `/get` call, well below the server's `maxGetResults`.
+const SAMPLE_GET_CHUNK: usize = 50;
+
+fn spam_train_opted_in() -> bool {
+    std::env::var("STALWART_TEST_SPAM_TRAIN").as_deref() == Ok("1")
+}
+
+/// The unique part of a [`unique_subject`]: its trailing timestamp. Stalwart
+/// stores a sample's subject normalised as a thread name, so samples are
+/// matched on this token rather than on the full subject.
+fn subject_token(subject: &str) -> &str {
+    subject.rsplit(' ').next().unwrap_or(subject)
+}
+
+/// Ids of every spam training sample of the account, paged through `/query`
+/// because `/get` with `ids: null` silently truncates at the server's cap.
+async fn sample_ids(raw: &RawJmap) -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    let mut position = 0usize;
+    for _ in 0..SAMPLE_MAX_PAGES {
+        let page = raw
+            .call(
+                &SAMPLE_USING,
+                SAMPLE_QUERY,
+                json!({
+                    "accountId": raw.account_id(),
+                    "position": position,
+                    "limit": SAMPLE_PAGE,
+                    "calculateTotal": true,
+                }),
+            )
+            .await
+            .map_err(|e| format!("{SAMPLE_QUERY} failed: {e}"))?;
+        let batch = page["ids"]
+            .as_array()
+            .ok_or_else(|| format!("{SAMPLE_QUERY} returned no ids array"))?;
+        if batch.is_empty() {
+            return Ok(ids);
+        }
+        position += batch.len();
+        ids.extend(batch.iter().filter_map(|v| v.as_str().map(str::to_owned)));
+        if page["total"]
+            .as_u64()
+            .is_some_and(|total| position as u64 >= total)
+        {
+            return Ok(ids);
+        }
+    }
+    Err(format!(
+        "{SAMPLE_QUERY} did not finish within {SAMPLE_MAX_PAGES} pages"
+    ))
+}
+
+/// Split the samples created since `before` into this run's own (subject
+/// carries `token`) and everything else. Only the first list is ever destroyed.
+async fn new_samples(
+    raw: &RawJmap,
+    before: &HashSet<String>,
+    token: &str,
+) -> Result<(Vec<String>, Vec<String>), String> {
+    let new: Vec<String> = sample_ids(raw)
+        .await?
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect();
+    let mut own = Vec::new();
+    for chunk in new.chunks(SAMPLE_GET_CHUNK) {
+        let got = raw
+            .call(
+                &SAMPLE_USING,
+                SAMPLE_GET,
+                json!({
+                    "accountId": raw.account_id(),
+                    "ids": chunk,
+                    "properties": ["id", "subject"],
+                }),
+            )
+            .await
+            .map_err(|e| format!("{SAMPLE_GET} failed: {e}"))?;
+        for item in got["list"].as_array().into_iter().flatten() {
+            let is_own = item["subject"]
+                .as_str()
+                .is_some_and(|subject| subject.contains(token));
+            if let (true, Some(id)) = (is_own, item["id"].as_str()) {
+                own.push(id.to_owned());
+            }
+        }
+    }
+    let foreign = new.into_iter().filter(|id| !own.contains(id)).collect();
+    Ok((own, foreign))
+}
+
+/// Destroy the given samples and fail unless the server destroyed every one.
+async fn destroy_samples(raw: &RawJmap, ids: &[String]) -> Result<(), String> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let response = raw
+        .call(
+            &SAMPLE_USING,
+            SAMPLE_SET,
+            json!({ "accountId": raw.account_id(), "destroy": ids }),
+        )
+        .await
+        .map_err(|e| format!("{SAMPLE_SET} destroy failed: {e}"))?;
+    let destroyed: HashSet<&str> = response["destroyed"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    let missing: Vec<&String> = ids
+        .iter()
+        .filter(|id| !destroyed.contains(id.as_str()))
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{SAMPLE_SET} did not destroy {missing:?}: notDestroyed {}",
+            response["notDestroyed"]
+        ))
+    }
+}
+
+/// Destroy the samples this run caused (new since `before`, subject carries
+/// `token`) and check that afterwards the account holds only samples from
+/// `before` plus new ones that are not ours, which are left untouched.
+/// Returns how many samples were ours.
+async fn restore_samples(
+    raw: &RawJmap,
+    before: &HashSet<String>,
+    token: &str,
+) -> Result<usize, String> {
+    // Email/set writes its samples within the request; allow a moment anyway.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let (own, foreign) = new_samples(raw, before, token).await?;
+    eprintln!(
+        "samples: {} before, {} caused by this test {own:?}, {} new from elsewhere (untouched)",
+        before.len(),
+        own.len(),
+        foreign.len()
+    );
+    destroy_samples(raw, &own).await?;
+    let after = sample_ids(raw).await?;
+    let gone_elsewhere = before.difference(&after).count();
+    eprintln!(
+        "samples after cleanup: {} (prior {}, {gone_elsewhere} prior ones consumed or expired meanwhile)",
+        after.len(),
+        before.len()
+    );
+    let left: Vec<&String> = own.iter().filter(|id| after.contains(*id)).collect();
+    if !left.is_empty() {
+        return Err(format!("our samples {left:?} still exist after destroy"));
+    }
+    let unexpected: Vec<&String> = after
+        .iter()
+        .filter(|id| !before.contains(*id) && !foreign.contains(*id))
+        .collect();
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "samples {unexpected:?} appeared during cleanup; not touched"
+        ));
+    }
+    if foreign.is_empty() && gone_elsewhere == 0 && after.len() != before.len() {
+        return Err(format!(
+            "sample count is {} after cleanup, expected the prior {}",
+            after.len(),
+            before.len()
+        ));
+    }
+    Ok(own.len())
+}
+
+/// `spam_train` (`x:SpamTrainingSample/set`) on a self-created draft: train
+/// once, find the sample it created, destroy it, check the sample count is
+/// back, delete the draft. Only runs with STALWART_TEST_SPAM_TRAIN=1.
 #[tokio::test]
 #[ignore = "requires running Stalwart instance"]
 async fn test_spam_training() {
-    if std::env::var("STALWART_TEST_SPAM_TRAIN").as_deref() != Ok("1") {
+    if !spam_train_opted_in() {
         eprintln!("skipped: set STALWART_TEST_SPAM_TRAIN=1 to train the spam model");
         return;
     }
@@ -712,13 +902,18 @@ async fn test_spam_training() {
         return;
     };
     let client = connect(&config).await;
+    let raw = ok("raw JMAP client", client.raw());
+    let before = sample_ids(&raw)
+        .await
+        .unwrap_or_else(|e| panic!("{e} (nothing was created)"));
+    eprintln!("samples before: {}", before.len());
     let subject = unique_subject("spam-train");
 
     let id = ok(
         "Email/set create (create_draft)",
         create_self_draft(&client, &config, &subject).await,
     );
-    eprintln!("created draft {id} with subject {subject:?}");
+    eprintln!("created draft {id}");
 
     let outcome: Result<(), String> = async {
         let blobs = client
@@ -737,24 +932,117 @@ async fn test_spam_training() {
         let result = spam
             .train_batch(&[blob_id], true)
             .await
-            .map_err(|e| format!("SpamTrainingSample/set failed: {e}"))?;
-        eprintln!("SpamTrainingSample/set result: {result:?}");
+            .map_err(|e| format!("x:SpamTrainingSample/set failed: {e}"))?;
+        eprintln!("x:SpamTrainingSample/set result: {result:?}");
         if result.success != 1 || result.failed != 0 {
             return Err(format!(
-                "SpamTrainingSample/set did not create the sample: {result:?}"
+                "x:SpamTrainingSample/set did not create the sample: {result:?}"
             ));
         }
         Ok(())
     }
     .await;
 
+    let samples = restore_samples(&raw, &before, subject_token(&subject)).await;
     let cleaned = cleanup(&client, &id, &subject).await;
     if let Err(msg) = outcome {
-        panic!("{msg} ({cleaned:?})");
+        panic!("{msg} (samples: {samples:?}, draft cleanup: {cleaned:?})");
     }
-    if let Err(msg) = cleaned {
-        panic!("{msg}");
+    let own = samples.unwrap_or_else(|e| panic!("{e} (draft cleanup: {cleaned:?})"));
+    assert_eq!(
+        own, 1,
+        "expected exactly one sample from this test, found {own}"
+    );
+    assert_eq!(cleaned, Ok(1), "the draft was not destroyed exactly once");
+}
+
+/// `mail_bulk_junk`'s JMAP path (`bulk_keyword_and_move` with `$junk`, target
+/// resolved by role) on a self-created draft: into Junk, then back to Drafts,
+/// then destroyed. Stalwart 1.1.1 stores a training sample on each move (spam
+/// into Junk, ham out of it), so the test also destroys exactly the samples it
+/// caused. Only runs with STALWART_TEST_SPAM_TRAIN=1.
+#[tokio::test]
+#[ignore = "requires running Stalwart instance"]
+async fn test_bulk_junk() {
+    if !spam_train_opted_in() {
+        eprintln!("skipped: set STALWART_TEST_SPAM_TRAIN=1 to train the spam model");
+        return;
     }
+    let Some(config) = test_config() else {
+        eprintln!("skipped: STALWART_TEST_URL and STALWART_TEST_USER not set");
+        return;
+    };
+    let client = connect(&config).await;
+    let raw = ok("raw JMAP client", client.raw());
+    let drafts = ok(
+        "Mailbox/get",
+        client.resolve_mailbox_by_role("Drafts").await,
+    )
+    .expect("no Drafts mailbox by role (nothing was created)");
+    let junk = ok("Mailbox/get", client.resolve_mailbox_by_role("Junk").await)
+        .expect("no Junk mailbox by role (nothing was created)");
+    let before = sample_ids(&raw)
+        .await
+        .unwrap_or_else(|e| panic!("{e} (nothing was created)"));
+    eprintln!("samples before: {}", before.len());
+    let subject = unique_subject("bulk-junk");
+
+    let id = ok(
+        "Email/set create (create_draft)",
+        create_self_draft(&client, &config, &subject).await,
+    );
+    eprintln!("created draft {id}");
+
+    let outcome = junk_steps(&client, &id, &drafts, &junk).await;
+    let samples = restore_samples(&raw, &before, subject_token(&subject)).await;
+    // `cleanup` finds the message by id in any mailbox, Junk included.
+    let cleaned = cleanup(&client, &id, &subject).await;
+    let in_junk = listed_in_mailbox(&client, &junk, &id).await;
+    let exists = client.get_email(&id).await.is_ok();
+    eprintln!("after cleanup: exists {exists}, listed in Junk {in_junk:?}");
+
+    if let Err(msg) = outcome {
+        panic!("{msg} (samples: {samples:?}, draft cleanup: {cleaned:?})");
+    }
+    let own = samples.unwrap_or_else(|e| panic!("{e} (draft cleanup: {cleaned:?})"));
+    eprintln!("destroyed {own} samples caused by the two moves");
+    assert_eq!(cleaned, Ok(1), "the draft was not destroyed exactly once");
+    assert!(!exists, "{id} still exists after cleanup");
+    assert_eq!(in_junk, Ok(false), "{id} is still listed in Junk");
+}
+
+async fn junk_steps(client: &JmapClient, id: &str, drafts: &str, junk: &str) -> Result<(), String> {
+    let ids = [id.to_string()];
+    let moved = client
+        .bulk_keyword_and_move(&ids, "$junk", true, junk)
+        .await
+        .map_err(|e| format!("Email/set $junk + move to Junk failed: {e}"))?;
+    if moved != 1 {
+        return Err(format!("move to Junk reported {moved} updated, expected 1"));
+    }
+    if !listed_in_mailbox(client, junk, id).await? {
+        return Err(format!("Email/query inMailbox Junk does not list {id}"));
+    }
+    if listed_in_mailbox(client, drafts, id).await? {
+        return Err(format!("{id} is still in Drafts after the move to Junk"));
+    }
+
+    let back = client
+        .bulk_keyword_and_move(&ids, "$junk", false, drafts)
+        .await
+        .map_err(|e| format!("Email/set $junk removed + move to Drafts failed: {e}"))?;
+    if back != 1 {
+        return Err(format!(
+            "move back to Drafts reported {back} updated, expected 1"
+        ));
+    }
+    if !listed_in_mailbox(client, drafts, id).await? {
+        return Err(format!("Email/query inMailbox Drafts does not list {id}"));
+    }
+    if listed_in_mailbox(client, junk, id).await? {
+        return Err(format!("{id} is still in Junk after the move back"));
+    }
+    Ok(())
 }
 
 /// Print the JMAP session capabilities and any product/version the server

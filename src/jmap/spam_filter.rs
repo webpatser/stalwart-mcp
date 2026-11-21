@@ -1,14 +1,17 @@
 use crate::error::AppError;
-use crate::jmap::raw::read_body_capped;
+use crate::jmap::raw::{describe_error, read_body_capped};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 const STALWART_JMAP_CAPABILITY: &str = "urn:stalwart:jmap";
 const JMAP_CORE_CAPABILITY: &str = "urn:ietf:params:jmap:core";
-const SPAM_TRAINING_SET: &str = "SpamTrainingSample/set";
+/// Stalwart 1.1 dispatches its registry objects only under the `x:` prefix
+/// (`jmap-proto/src/request/method.rs` at v1.1.1), with `urn:stalwart:jmap`
+/// in `using`; the bare `SpamTrainingSample/set` is an unknown method there.
+const SPAM_TRAINING_SET: &str = "x:SpamTrainingSample/set";
 
-/// Client for Stalwart v0.16's JMAP `SpamTrainingSample/set` method.
+/// Client for Stalwart's JMAP `x:SpamTrainingSample/set` method.
 ///
 /// Training runs under the user's own account credentials: no admin auth required.
 /// The server downloads the referenced email blob, parses it, and stores it as
@@ -66,7 +69,7 @@ impl SpamFilterClient {
         let request = serde_json::json!({
             "using": [JMAP_CORE_CAPABILITY, STALWART_JMAP_CAPABILITY],
             "methodCalls": [[
-                "SpamTrainingSample/set",
+                SPAM_TRAINING_SET,
                 {
                     "accountId": self.account_id,
                     "create": create,
@@ -108,9 +111,7 @@ impl SpamFilterClient {
             .ok_or_else(|| AppError::JmapRequest("Empty methodResponses array".into()))?;
 
         if name == "error" {
-            return Err(AppError::JmapRequest(format!(
-                "JMAP request-level error: {value}"
-            )));
+            return Err(method_error(&value));
         }
 
         let set_response: SetResponse = serde_json::from_value(value).map_err(|e| {
@@ -137,6 +138,23 @@ impl SpamFilterClient {
             success,
             failed,
         })
+    }
+}
+
+/// A method-level refusal, passed on to the MCP client with the server's
+/// reason. Stalwart 1.1.1 answers `forbidden` when the account lacks the
+/// permission to create spam training samples, which users do not get by
+/// default; say so, because the server's text does not name the permission.
+fn method_error(err: &serde_json::Value) -> AppError {
+    let reason = describe_error(err);
+    if err["type"].as_str() == Some("forbidden") {
+        AppError::Rejected(format!(
+            "{SPAM_TRAINING_SET}: {reason}. The account needs Stalwart's permission to create \
+             spam training samples (sysSpamTrainingSampleCreate); moving mail into or out of \
+             Junk still trains the classifier without it"
+        ))
+    } else {
+        AppError::Rejected(format!("{SPAM_TRAINING_SET}: {reason}"))
     }
 }
 
@@ -196,7 +214,7 @@ mod tests {
         let request = serde_json::json!({
             "using": [JMAP_CORE_CAPABILITY, STALWART_JMAP_CAPABILITY],
             "methodCalls": [[
-                "SpamTrainingSample/set",
+                SPAM_TRAINING_SET,
                 { "accountId": "acct-1", "create": create },
                 "c0",
             ]],
@@ -207,7 +225,7 @@ mod tests {
         assert_eq!(using[1], "urn:stalwart:jmap");
 
         let call = &request["methodCalls"][0];
-        assert_eq!(call[0], "SpamTrainingSample/set");
+        assert_eq!(call[0], "x:SpamTrainingSample/set");
         assert_eq!(call[1]["accountId"], "acct-1");
         assert_eq!(call[1]["create"]["s0"]["blobId"], "blob1");
         assert_eq!(call[1]["create"]["s0"]["isSpam"], true);
@@ -238,6 +256,30 @@ mod tests {
         let set: SetResponse = serde_json::from_value(value).unwrap();
         assert_eq!(set.created.unwrap().len(), 1);
         assert_eq!(set.not_created.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn forbidden_is_rejected_with_the_permission_hint() {
+        // Redacted from the live answer of Stalwart 1.1.1 to a plain user.
+        let err = serde_json::json!({
+            "type": "forbidden",
+            "description": "You are not authorized to create objects of this type"
+        });
+        let AppError::Rejected(msg) = method_error(&err) else {
+            panic!("forbidden must map to Rejected");
+        };
+        assert!(msg.contains("not authorized"), "{msg}");
+        assert!(msg.contains("sysSpamTrainingSampleCreate"), "{msg}");
+    }
+
+    #[test]
+    fn other_method_errors_are_rejected_without_the_hint() {
+        let err = serde_json::json!({ "type": "unknownMethod" });
+        let AppError::Rejected(msg) = method_error(&err) else {
+            panic!("a method error must map to Rejected");
+        };
+        assert!(msg.contains("unknownMethod"), "{msg}");
+        assert!(!msg.contains("sysSpamTrainingSampleCreate"), "{msg}");
     }
 
     #[test]

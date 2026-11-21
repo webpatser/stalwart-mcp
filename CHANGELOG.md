@@ -9,6 +9,11 @@
 - `mail_get_thread` (JMAP `Thread/get`, RFC 8621), scope `mail:read`: returns the conversation of a message as message summaries in the server's thread order, oldest first. Default 20 messages, at most 50; a longer thread returns the most recent ones plus an `omitted` count. An unknown message id is a not-found error.
 - `mail_search` takes an optional `snippets` argument (default false). When true, `SearchSnippet/get` runs for the returned results and each gets a `snippet` with highlighted `subject` and `preview`; the server's `<mark>` tags are kept as returned. Without it the output is unchanged.
 - Blob upload and download for the raw JMAP client; the session URLs must stay on the API URL's origin and redirects are not followed.
+- Live tests for `spam_train` and `mail_bulk_junk` (`test_spam_training`, new `test_bulk_junk`), both opt-in with `STALWART_TEST_SPAM_TRAIN=1`. Each works on its own draft and destroys exactly the training samples it caused, found as new samples whose subject carries the run's unique token, then checks the sample count is back. `test_bulk_junk` needs this because Stalwart 1.1.1 stores a training sample on every move into Junk (spam) and out of it (ham). Destroying a sample does not undo training the classifier has already done.
+
+### Fixed
+- `spam_train` called `SpamTrainingSample/set`, which Stalwart 1.1.1 does not dispatch: its registry objects are only reachable under the `x:` prefix (`jmap-proto/src/request/method.rs` at `v1.1.1`). It now calls `x:SpamTrainingSample/set` with `urn:stalwart:jmap` in `using`.
+- A method-level refusal of `spam_train` now reaches the MCP client with the server's reason instead of "Upstream request failed". On `forbidden` it adds that the account needs Stalwart's permission to create spam training samples (`sysSpamTrainingSampleCreate`), which a plain user account on Stalwart 1.1.1 does not have: the live run of `test_spam_training` was refused with exactly that error.
 
 ## [1.1.1-3] - 2026-11-21
 
