@@ -6,6 +6,7 @@ use jmap_client::core::response::{
 };
 use jmap_client::core::set::SetObject;
 use jmap_client::email;
+use jmap_client::email::search_snippet::SearchSnippet;
 use jmap_client::identity::Identity;
 use jmap_client::mailbox;
 use serde::Serialize;
@@ -204,40 +205,8 @@ impl JmapClient {
             .sort([email::query::Comparator::received_at().descending()])
             .limit(search.limit);
 
-        let mut filters: Vec<email::query::Filter> = Vec::new();
-        if let Some(text) = search.text {
-            filters.push(email::query::Filter::text(text));
-        }
-        if let Some(from) = search.from {
-            filters.push(email::query::Filter::from(from));
-        }
-        if let Some(to) = search.to {
-            filters.push(email::query::Filter::to(to));
-        }
-        if let Some(subject) = search.subject {
-            filters.push(email::query::Filter::subject(subject));
-        }
-        if let Some(mb_id) = search.mailbox_id {
-            filters.push(email::query::Filter::in_mailbox(mb_id));
-        }
-        if let Some(ts) = search.after {
-            filters.push(email::query::Filter::after(ts));
-        }
-        if let Some(ts) = search.before {
-            filters.push(email::query::Filter::before(ts));
-        }
-        if let Some(true) = search.has_attachment {
-            filters.push(email::query::Filter::has_attachment(true));
-        }
-
-        match filters.len() {
-            0 => {}
-            1 => {
-                q.filter(filters.into_iter().next().unwrap());
-            }
-            _ => {
-                q.filter(Filter::and(filters));
-            }
+        if let Some(filter) = build_search_filter(search) {
+            q.filter(filter);
         }
 
         let query_response = request
@@ -273,6 +242,39 @@ impl JmapClient {
         let emails = response.list().iter().map(email_to_summary).collect();
 
         Ok(emails)
+    }
+
+    /// [`Self::search_emails`], then `SearchSnippet/get` (RFC 8621 section 5)
+    /// with the same filter for the returned ids. Matches in the snippets are
+    /// wrapped in `<mark>` tags by the server and kept as returned.
+    pub async fn search_emails_with_snippets(
+        &self,
+        search: &SearchFilters<'_>,
+    ) -> Result<Vec<SnippetEmail>, AppError> {
+        let emails = self.search_emails(search).await?;
+        if emails.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut request = self.client.build();
+        let snippet_request = request
+            .get_search_snippet()
+            .email_ids(emails.iter().map(|e| e.id.as_str()));
+        // Stalwart 1.1.1 only reads text, subject and body conditions for
+        // snippets (crates/jmap/src/email/snippet.rs); other conditions
+        // (sender, mailbox, dates) select emails but have nothing to highlight.
+        let highlight = SearchFilters {
+            text: search.text,
+            subject: search.subject,
+            ..Default::default()
+        };
+        if let Some(filter) = build_search_filter(&highlight) {
+            snippet_request.filter(filter);
+        }
+        let response = request
+            .send_get_search_snippet()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+        Ok(attach_snippets(emails, response.list()))
     }
 
     /// Set or unset a keyword on an email
@@ -696,7 +698,73 @@ impl JmapClient {
     }
 }
 
-fn email_to_summary(e: &email::Email) -> EmailSummary {
+/// The `Email/query` filter for `search`: none, a single condition, or an AND.
+fn build_search_filter(search: &SearchFilters<'_>) -> Option<Filter<email::query::Filter>> {
+    let mut filters: Vec<email::query::Filter> = Vec::new();
+    if let Some(text) = search.text {
+        filters.push(email::query::Filter::text(text));
+    }
+    if let Some(from) = search.from {
+        filters.push(email::query::Filter::from(from));
+    }
+    if let Some(to) = search.to {
+        filters.push(email::query::Filter::to(to));
+    }
+    if let Some(subject) = search.subject {
+        filters.push(email::query::Filter::subject(subject));
+    }
+    if let Some(mb_id) = search.mailbox_id {
+        filters.push(email::query::Filter::in_mailbox(mb_id));
+    }
+    if let Some(ts) = search.after {
+        filters.push(email::query::Filter::after(ts));
+    }
+    if let Some(ts) = search.before {
+        filters.push(email::query::Filter::before(ts));
+    }
+    if let Some(true) = search.has_attachment {
+        filters.push(email::query::Filter::has_attachment(true));
+    }
+    match filters.len() {
+        0 => None,
+        1 => filters.into_iter().next().map(Filter::from),
+        _ => Some(Filter::and(filters)),
+    }
+}
+
+/// Highlighted excerpts of one search result; `<mark>` tags kept as returned.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Snippet {
+    pub subject: Option<String>,
+    pub preview: Option<String>,
+}
+
+/// A search result with its snippet (`None` when the server returned none).
+#[derive(Debug, Serialize)]
+pub struct SnippetEmail {
+    #[serde(flatten)]
+    pub email: EmailSummary,
+    pub snippet: Option<Snippet>,
+}
+
+/// Pair each email with the snippet of the same id, keeping the email order.
+fn attach_snippets(emails: Vec<EmailSummary>, snippets: &[SearchSnippet]) -> Vec<SnippetEmail> {
+    emails
+        .into_iter()
+        .map(|email| {
+            let snippet = snippets
+                .iter()
+                .find(|s| s.email_id() == email.id)
+                .map(|s| Snippet {
+                    subject: s.subject().map(str::to_string),
+                    preview: s.preview().map(str::to_string),
+                });
+            SnippetEmail { email, snippet }
+        })
+        .collect()
+}
+
+pub(crate) fn email_to_summary(e: &email::Email) -> EmailSummary {
     let keywords = e.keywords();
     EmailSummary {
         id: e.id().unwrap_or_default().to_string(),
@@ -1107,6 +1175,88 @@ mod set_response_tests {
         assert!(updated_one(&mut email_set(ACCEPTED), "m1").is_ok());
         assert_eq!(updated_count(&email_set(ACCEPTED)).expect("count"), 2);
         assert_eq!(destroyed_count(&mut email_set(ACCEPTED)).expect("count"), 1);
+    }
+}
+
+#[cfg(test)]
+mod snippet_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn summary(id: &str) -> EmailSummary {
+        EmailSummary {
+            id: id.into(),
+            subject: Some("Plans".into()),
+            from: vec![],
+            to: vec![],
+            received_at: Some(1_700_000_000),
+            is_unread: true,
+            is_flagged: false,
+            preview: Some("Lunch plans".into()),
+        }
+    }
+
+    fn snippets() -> Vec<SearchSnippet> {
+        serde_json::from_value(json!([
+            {"emailId": "m1", "subject": "<mark>Plans</mark>", "preview": "Lunch <mark>plans</mark>"},
+            {"emailId": "m3", "subject": null, "preview": null}
+        ]))
+        .expect("snippets")
+    }
+
+    #[test]
+    fn snippets_attach_by_email_id_and_keep_marks() {
+        let out = attach_snippets(
+            vec![summary("m1"), summary("m2"), summary("m3")],
+            &snippets(),
+        );
+        assert_eq!(
+            out[0].snippet,
+            Some(Snippet {
+                subject: Some("<mark>Plans</mark>".into()),
+                preview: Some("Lunch <mark>plans</mark>".into()),
+            })
+        );
+        assert_eq!(out[1].snippet, None, "no snippet returned for m2");
+        assert_eq!(
+            out[2].snippet,
+            Some(Snippet {
+                subject: None,
+                preview: None
+            })
+        );
+        let ids: Vec<&str> = out.iter().map(|e| e.email.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn snippet_result_flattens_the_summary() {
+        let out = attach_snippets(vec![summary("m1")], &snippets());
+        let value = serde_json::to_value(&out).expect("json");
+        assert_eq!(value[0]["id"], "m1");
+        assert_eq!(value[0]["subject"], "Plans");
+        assert_eq!(value[0]["snippet"]["preview"], "Lunch <mark>plans</mark>");
+    }
+
+    #[test]
+    fn summary_output_without_snippets_is_unchanged() {
+        let value = serde_json::to_value(summary("m1")).expect("json");
+        assert!(value.get("snippet").is_none());
+        assert_eq!(value.as_object().map(|o| o.len()), Some(8));
+    }
+
+    #[test]
+    fn filter_shapes() {
+        let none = SearchFilters::default();
+        assert!(build_search_filter(&none).is_none());
+        let one = SearchFilters {
+            text: Some("plans"),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(build_search_filter(&one)).expect("json"),
+            json!({"text": "plans"})
+        );
     }
 }
 

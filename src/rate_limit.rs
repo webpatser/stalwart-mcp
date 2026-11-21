@@ -53,6 +53,7 @@ impl RateLimiters {
         limiters.insert("mail_list_recent", TokenBucket::new(60));
         limiters.insert("mail_search", TokenBucket::new(30));
         limiters.insert("mail_get", TokenBucket::new(60));
+        limiters.insert("mail_get_thread", TokenBucket::new(60));
         limiters.insert("mail_flag", TokenBucket::new(30));
         limiters.insert("mail_move", TokenBucket::new(30));
         limiters.insert("mail_draft", TokenBucket::new(10));

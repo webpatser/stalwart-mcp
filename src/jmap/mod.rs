@@ -5,6 +5,7 @@ pub mod masked_email;
 pub mod raw;
 pub mod sieve;
 pub mod spam_filter;
+pub mod thread;
 
 use crate::config::AccountConfig;
 use crate::error::AppError;

@@ -13,8 +13,9 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 |------|-------------|
 | `mail_list_folders` | List mailboxes with message counts |
 | `mail_list_recent` | Recent emails, filtered by folder, date range, unread |
-| `mail_search` | Search by full-text, sender, recipient, subject, date, attachments |
+| `mail_search` | Search by full-text, sender, recipient, subject, date, attachments. Optional `snippets: true` adds highlighted `subject` and `preview` excerpts per result (`SearchSnippet/get`; the server marks matches with `<mark>` tags, returned as is) |
 | `mail_get` | Full message content with attachment metadata |
+| `mail_get_thread` | The conversation of a message (`Thread/get`), oldest first in the server's thread order, as message summaries. Default 20, at most 50 messages; a longer thread returns the most recent ones and an `omitted` count |
 
 ### Write
 | Tool | Description |
@@ -243,7 +244,7 @@ Scopes and `--account` are enforced on every tool call and resource read. A toke
 
 | Scope | Tools |
 |-------|-------|
-| `mail:read` | `mail_list_folders`, `mail_list_recent`, `mail_search`, `mail_get`, `mail_masked_list`, `mail_vacation_get`, `quota_get`, `identity_list`, `sieve_list`, `sieve_get`, `sieve_validate`, `contacts_search` |
+| `mail:read` | `mail_list_folders`, `mail_list_recent`, `mail_search`, `mail_get`, `mail_get_thread`, `mail_masked_list`, `mail_vacation_get`, `quota_get`, `identity_list`, `sieve_list`, `sieve_get`, `sieve_validate`, `contacts_search` |
 | `mail:modify` | `mail_flag`, `mail_move`, `mail_draft`, `mail_bulk_read`, `mail_bulk_junk`, `mail_bulk_delete`, `mail_masked_create`, `mail_masked_disable`, `spam_train` |
 | `mail:send` | `mail_send`, `mail_vacation_set` (an enabled vacation response makes the server send auto-replies), `sieve_put` (a script can redirect mail) |
 

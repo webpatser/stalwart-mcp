@@ -45,6 +45,7 @@ pub const TOOL_SCOPES: &[(&str, Scope)] = &[
     ("mail_list_recent", Scope::Read),
     ("mail_search", Scope::Read),
     ("mail_get", Scope::Read),
+    ("mail_get_thread", Scope::Read),
     ("mail_masked_list", Scope::Read),
     ("mail_vacation_get", Scope::Read),
     ("quota_get", Scope::Read),

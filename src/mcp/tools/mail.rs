@@ -1,4 +1,5 @@
 use crate::jmap::mail::{ComposeEmail, SearchFilters};
+use crate::jmap::thread;
 use crate::mcp::StalwartMcp;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -52,6 +53,19 @@ pub struct SearchArgs {
     /// Only return emails with attachments
     pub has_attachment: Option<bool>,
     /// Maximum number of results (default: 20, max: 100)
+    pub limit: Option<usize>,
+    /// Also return highlighted subject and preview snippets per result (default: false)
+    #[serde(default)]
+    pub snippets: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetThreadArgs {
+    /// Account name to use. Omit for the default account.
+    pub account: Option<String>,
+    /// ID of any message in the thread
+    pub id: String,
+    /// Maximum messages to return (default 20, at most 50); the most recent ones are kept
     pub limit: Option<usize>,
 }
 
@@ -271,7 +285,7 @@ impl StalwartMcp {
     }
 
     #[tool(
-        description = "Search emails with filters. Supports full-text search (Meilisearch FTS), sender/recipient/subject filters, date range, and attachment filter. At least one filter must be provided. Stalwart indexes full text asynchronously, so mail created in the last minute may not be found yet."
+        description = "Search emails with filters. Supports full-text search (Meilisearch FTS), sender/recipient/subject filters, date range, and attachment filter. At least one filter must be provided. Stalwart indexes full text asynchronously, so mail created in the last minute may not be found yet. Set 'snippets' to true to add a 'snippet' with highlighted 'subject' and 'preview' excerpts per result for the query and subject filters; the server marks matches with <mark> tags, which are returned as is (null when nothing matched)."
     )]
     pub async fn mail_search(
         &self,
@@ -314,22 +328,57 @@ impl StalwartMcp {
             None
         };
 
-        let emails = client
-            .search_emails(&SearchFilters {
-                text: args.query.as_deref(),
-                from: args.from.as_deref(),
-                to: args.to.as_deref(),
-                subject: args.subject.as_deref(),
-                mailbox_id: mailbox_id.as_deref(),
-                after: args.after,
-                before: args.before,
-                has_attachment: args.has_attachment,
-                limit,
-            })
+        let filters = SearchFilters {
+            text: args.query.as_deref(),
+            from: args.from.as_deref(),
+            to: args.to.as_deref(),
+            subject: args.subject.as_deref(),
+            mailbox_id: mailbox_id.as_deref(),
+            after: args.after,
+            before: args.before,
+            has_attachment: args.has_attachment,
+            limit,
+        };
+
+        let json = if args.snippets {
+            let emails = client
+                .search_emails_with_snippets(&filters)
+                .await
+                .map_err(ErrorData::from)?;
+            serde_json::to_string_pretty(&emails)
+        } else {
+            let emails = client
+                .search_emails(&filters)
+                .await
+                .map_err(ErrorData::from)?;
+            serde_json::to_string_pretty(&emails)
+        }
+        .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    }
+
+    #[tool(
+        description = "Get the conversation (thread) a message belongs to, given the ID of any message in it. Returns the messages oldest first in the server's thread order, each with subject, sender, recipients, date, flags and preview. At most 50 messages (default 20); when the thread is longer the most recent ones are returned and 'omitted' says how many older ones were left out."
+    )]
+    pub async fn mail_get_thread(
+        &self,
+        Parameters(args): Parameters<GetThreadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.rate_limiters.check("mail_get_thread")?;
+        tracing::info!(event = "mail_get_thread", account = ?args.account, id = %args.id, "Tool called");
+
+        let client = self
+            .accounts
+            .get(args.account.as_deref())
+            .map_err(ErrorData::from)?;
+
+        let thread = client
+            .get_thread(&args.id, thread::effective_limit(args.limit))
             .await
             .map_err(ErrorData::from)?;
 
-        let json = serde_json::to_string_pretty(&emails)
+        let json = serde_json::to_string_pretty(&thread)
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
@@ -769,6 +818,25 @@ impl StalwartMcp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn search_snippets_default_to_false() {
+        let args: SearchArgs = serde_json::from_str(r#"{"query": "plans"}"#).expect("args");
+        assert!(!args.snippets);
+        let args: SearchArgs =
+            serde_json::from_str(r#"{"query": "plans", "snippets": true}"#).expect("args");
+        assert!(args.snippets);
+        let schema = serde_json::to_value(schemars::schema_for!(SearchArgs)).expect("schema");
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.iter().any(|r| r == "snippets"), "{schema}");
+    }
+
+    #[test]
+    fn thread_args_need_only_an_id() {
+        let args: GetThreadArgs = serde_json::from_str(r#"{"id": "m1"}"#).expect("args");
+        assert_eq!(args.limit, None);
+        assert!(serde_json::from_str::<GetThreadArgs>("{}").is_err());
+    }
 
     #[test]
     fn bulk_delete_defaults_to_trash_mode() {

@@ -602,6 +602,79 @@ async fn test_quota_and_identities() {
     assert!(identities.iter().all(|i| i.email.contains('@')));
 }
 
+/// Read-only. `mail_get_thread` on the newest inbox message, then one search
+/// with snippets. Prints counts only, never a subject, sender or snippet.
+#[tokio::test]
+#[ignore = "requires running Stalwart instance"]
+async fn test_thread_and_search_snippets_read_only() {
+    use stalwart_mcp::jmap::mail::SearchFilters;
+    use stalwart_mcp::jmap::thread::MAX_LIMIT;
+
+    let Some(client) = connect().await else {
+        return;
+    };
+    let inbox =
+        ok("Mailbox/get", client.resolve_mailbox_by_role("inbox").await).expect("inbox mailbox");
+    let recent = ok(
+        "Email/query",
+        client
+            .list_recent_emails(Some(&inbox), 1, false, None, None, None)
+            .await,
+    );
+    let Some(newest) = recent.first() else {
+        eprintln!("inbox is empty, thread check skipped");
+        return;
+    };
+
+    let thread = ok("get_thread", client.get_thread(&newest.id, 5).await);
+    eprintln!(
+        "thread: total {}, returned {}, omitted {}",
+        thread.total,
+        thread.messages.len(),
+        thread.omitted
+    );
+    assert!(thread.messages.len() <= 5 && thread.messages.len() <= MAX_LIMIT);
+    assert_eq!(thread.omitted, thread.total - thread.messages.len());
+    assert!(
+        thread.messages.iter().any(|m| m.id == newest.id),
+        "the message's own id is not in its thread"
+    );
+
+    let err = client
+        .get_thread("no-such-message-id", 5)
+        .await
+        .expect_err("unknown id must fail");
+    eprintln!(
+        "unknown id error is not-found: {}",
+        matches!(err, AppError::NotFound(_))
+    );
+    assert!(matches!(err, AppError::NotFound(_)), "{err:?}");
+
+    let search = SearchFilters {
+        text: Some("mail"),
+        limit: 5,
+        ..Default::default()
+    };
+    let plain = ok("search", client.search_emails(&search).await);
+    let found = ok(
+        "search+snippets",
+        client.search_emails_with_snippets(&search).await,
+    );
+    eprintln!(
+        "search: {} plain, {} with snippets",
+        plain.len(),
+        found.len()
+    );
+    assert_eq!(found.len(), plain.len());
+    let with_snippet = found.iter().filter(|f| f.snippet.is_some()).count();
+    eprintln!("results with a snippet entry: {with_snippet}");
+    for entry in &found {
+        let shape = serde_json::to_value(entry).expect("json");
+        assert!(shape.get("snippet").is_some(), "missing snippet key");
+        assert!(shape.get("id").is_some() && shape.get("subject").is_some());
+    }
+}
+
 /// Read-only. Prints counts only, never a name or an address.
 #[tokio::test]
 #[ignore = "requires running Stalwart instance"]
