@@ -22,7 +22,7 @@ Existing Gmail and Outlook MCP servers route queries through Google/Microsoft AP
 | `mail_flag` | Mark as read/unread/flagged/unflagged/junk/notjunk (junk auto-moves to Junk folder) |
 | `mail_move` | Move to folder (Archive, Trash, etc.) |
 | `mail_bulk_junk` | Bulk mark emails as junk/notjunk in a single JMAP request |
-| `mail_bulk_delete` | Permanently delete multiple emails in a single JMAP request |
+| `mail_bulk_delete` | Delete multiple emails in a single JMAP request: moves them to Trash by default (fails if no Trash mailbox exists); `permanent: true` destroys them and requires `capabilities.delete` |
 | `mail_bulk_read` | Bulk mark emails as read in a single JMAP request |
 | `mail_draft` | Save draft in Drafts folder |
 | `mail_send` | Send email (requires `capabilities.send = true` in config) |
@@ -85,7 +85,7 @@ To pick a build for your server, take the newest tag whose first three numbers a
 
 Test coverage for `1.0.3-1`: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3.
 
-Test coverage for `1.1.1-1`, run live against Stalwart 1.1.1 (`tests/integration_mail.rs` and `tests/integration_account.rs`): connect and session capabilities; mailbox listing and role lookup; recent listing, search, full message, raw blob and Message-ID reads; the draft lifecycle (create, search, read/unread, move to Trash, permanent delete); masked email list, create, disable and destroy; vacation response get, set (disabled only) and restore; `Quota/get` (on an account without a disk quota, so an empty list) and `Identity/get`; `mail_send` (`Email/set` plus `EmailSubmission/set`, one real message, with the fixes from `1.1.1-2`).
+Test coverage for `1.1.1-1`, run live against Stalwart 1.1.1 (`tests/integration_mail.rs` and `tests/integration_account.rs`): connect and session capabilities; mailbox listing and role lookup; recent listing, search, full message, raw blob and Message-ID reads; the draft lifecycle (create, search, read/unread, both `mail_bulk_delete` modes: bulk move to Trash, then permanent delete); masked email list, create, disable and destroy; vacation response get, set (disabled only) and restore; `Quota/get` (on an account without a disk quota, so an empty list) and `Identity/get`; `mail_send` (`Email/set` plus `EmailSubmission/set`, one real message, with the fixes from `1.1.1-2`).
 
 Test coverage for `1.1.1-2`: every tool except `spam_train` (`SpamTrainingSample/set`) has now been run live against Stalwart 1.1.1, including `mail_send` and a draft whose From is the identity's address. Paths not exercised live: an enabled vacation response and the masked address quota error.
 
@@ -129,6 +129,9 @@ password_env = "STALWART_PASSWORD_WORK"
 # the server auto-reply to every sender, also after the session ends, until its
 # to_date (required, at most 90 days ahead). Reading it is always allowed.
 # vacation = true
+# Allow mail_bulk_delete with permanent = true, which destroys emails beyond
+# recovery (default: false). Moving them to Trash, the default, is always allowed.
+# delete = true
 
 [notifications]
 # Real-time email notifications via JMAP EventSource (default: true)

@@ -98,8 +98,25 @@ pub struct BulkJunkArgs {
 pub struct BulkDeleteArgs {
     /// Account name to use. Omit for the default account.
     pub account: Option<String>,
-    /// List of email message IDs to permanently delete
+    /// List of email message IDs to delete
     pub ids: Vec<String>,
+    /// Destroy the emails permanently instead of moving them to Trash.
+    /// Requires 'capabilities.delete = true' in server config. Default: false.
+    #[serde(default)]
+    pub permanent: bool,
+}
+
+/// Refuse a permanent delete unless `capabilities.delete` is enabled. Moving
+/// to Trash needs no capability. Runs before any network call.
+fn check_delete_allowed(permanent: bool, delete_enabled: bool) -> Result<(), ErrorData> {
+    if permanent && !delete_enabled {
+        return Err(ErrorData::invalid_request(
+            "Permanent deletion is disabled. Enable 'capabilities.delete = true' in config, \
+             or omit 'permanent' to move the emails to Trash.",
+            None,
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -602,13 +619,15 @@ impl StalwartMcp {
     }
 
     #[tool(
-        description = "Permanently delete multiple emails in a single JMAP request. This destroys the emails entirely: they cannot be recovered. Use this for bulk cleanup of unwanted but non-spam emails (e.g. DMARC reports, automated notifications)."
+        description = "Delete multiple emails in a single JMAP request. By default the emails are moved to the Trash mailbox (recoverable); fails if no Trash mailbox exists. With 'permanent: true' they are destroyed and cannot be recovered; that requires 'delete' capability to be enabled in server config. Use this for bulk cleanup of unwanted but non-spam emails (e.g. DMARC reports, automated notifications)."
     )]
     pub async fn mail_bulk_delete(
         &self,
         Parameters(args): Parameters<BulkDeleteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.rate_limiters.check("mail_bulk_delete")?;
+
+        check_delete_allowed(args.permanent, self.capabilities.delete)?;
 
         if args.ids.is_empty() {
             return Err(ErrorData::invalid_params("No email IDs provided", None));
@@ -618,6 +637,7 @@ impl StalwartMcp {
             event = "mail_bulk_delete",
             account = ?args.account,
             count = args.ids.len(),
+            permanent = args.permanent,
             "Tool called"
         );
 
@@ -626,14 +646,21 @@ impl StalwartMcp {
             .get(args.account.as_deref())
             .map_err(ErrorData::from)?;
 
-        let count = client
-            .bulk_destroy(&args.ids)
-            .await
-            .map_err(ErrorData::from)?;
+        let text = if args.permanent {
+            let count = client
+                .bulk_destroy(&args.ids)
+                .await
+                .map_err(ErrorData::from)?;
+            format!("{count} emails permanently deleted")
+        } else {
+            let count = client
+                .bulk_move_to_trash(&args.ids)
+                .await
+                .map_err(ErrorData::from)?;
+            format!("{count} emails moved to Trash")
+        };
 
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "{count} emails permanently deleted"
-        ))]))
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
     }
 
     #[tool(
@@ -736,5 +763,43 @@ impl StalwartMcp {
             .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
 
         Ok(CallToolResult::success(vec![ContentBlock::text(json)]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_delete_defaults_to_trash_mode() {
+        let args: BulkDeleteArgs = serde_json::from_str(r#"{"ids": ["m1"]}"#).expect("args");
+        assert!(!args.permanent);
+        let args: BulkDeleteArgs =
+            serde_json::from_str(r#"{"ids": ["m1"], "permanent": true}"#).expect("args");
+        assert!(args.permanent);
+    }
+
+    #[test]
+    fn permanent_delete_needs_the_delete_capability() {
+        let err = check_delete_allowed(true, false).expect_err("gated");
+        assert!(
+            err.message.contains("capabilities.delete = true"),
+            "{err:?}"
+        );
+        assert!(check_delete_allowed(true, true).is_ok());
+    }
+
+    #[test]
+    fn trash_mode_needs_no_capability() {
+        assert!(check_delete_allowed(false, false).is_ok());
+        assert!(check_delete_allowed(false, true).is_ok());
+    }
+
+    #[test]
+    fn bulk_delete_schema_exposes_permanent() {
+        let schema = serde_json::to_value(schemars::schema_for!(BulkDeleteArgs)).expect("schema");
+        assert!(schema["properties"]["permanent"].is_object(), "{schema}");
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.iter().any(|r| r == "permanent"), "{schema}");
     }
 }

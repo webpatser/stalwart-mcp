@@ -21,6 +21,9 @@ bind = "127.0.0.1:3000"
 [capabilities]
 # Allow sending emails via mail_send tool (default: false)
 # send = true
+# Allow mail_bulk_delete with permanent = true, which destroys emails beyond
+# recovery (default: false). Moving them to Trash is always allowed.
+# delete = true
 
 [notifications]
 # Enable JMAP EventSource for real-time notifications (default: true)

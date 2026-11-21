@@ -380,6 +380,46 @@ impl JmapClient {
         destroyed_count(&mut response)
     }
 
+    /// Bulk: move multiple emails to the Trash mailbox in one JMAP request.
+    /// Trash is resolved by its `trash` role, falling back to a folder named
+    /// "Trash". Fails with `NotFound` when neither exists; it never destroys.
+    /// Returns the number of emails the server actually moved.
+    pub async fn bulk_move_to_trash(&self, email_ids: &[String]) -> Result<usize, AppError> {
+        let trash_id = self
+            .resolve_special_mailbox("Trash")
+            .await?
+            .ok_or_else(|| {
+                AppError::NotFound(
+                    "Trash mailbox not found (no mailbox with role 'trash' or named 'Trash'); \
+                 nothing was deleted"
+                        .into(),
+                )
+            })?;
+        self.bulk_move(email_ids, &trash_id).await
+    }
+
+    /// Bulk: move multiple emails to one mailbox in one JMAP request.
+    /// Returns the number of emails the server reported as updated.
+    pub async fn bulk_move(
+        &self,
+        email_ids: &[String],
+        target_mailbox_id: &str,
+    ) -> Result<usize, AppError> {
+        let mut request = self.client.build();
+        let set = request.set_email().account_id(&self.account_id);
+
+        for id in email_ids {
+            set.update(id).mailbox_ids([target_mailbox_id]);
+        }
+
+        let response = request
+            .send_set_email()
+            .await
+            .map_err(|e| AppError::JmapRequest(e.to_string()))?;
+
+        updated_count(&response)
+    }
+
     /// The identity to send as: the one whose email matches `preferred`, else
     /// the account's first identity (`Identity/get`).
     async fn sender(&self, preferred: &str) -> Result<Sender, AppError> {
@@ -1099,5 +1139,34 @@ mod special_mailbox_tests {
             );
             assert_eq!(special_mailbox_id(&[], role), None);
         }
+    }
+
+    #[test]
+    fn trash_resolves_by_role_then_name() {
+        let mailboxes = vec![
+            mailbox("inbox", "Inbox", "inbox"),
+            mailbox("named", "Trash", "None"),
+            mailbox("role", "Prullenbak", "trash"),
+        ];
+        assert_eq!(special_mailbox_id(&mailboxes, "Trash"), Some("role"));
+        assert_eq!(special_mailbox_id(&mailboxes[..2], "Trash"), Some("named"));
+        assert_eq!(special_mailbox_id(&mailboxes[..1], "Trash"), None);
+    }
+
+    #[test]
+    fn updated_count_reports_only_accepted_moves() {
+        let response: EmailSetResponse = serde_json::from_str(
+            r#"{"accountId":"a","newState":"s1","updated":{"m1":null},
+                "notUpdated":{"m2":{"type":"notFound"}}}"#,
+        )
+        .expect("valid Email/set response");
+        assert_eq!(updated_count(&response).expect("count"), 1);
+
+        let response: EmailSetResponse = serde_json::from_str(
+            r#"{"accountId":"a","newState":"s1","updated":null,
+                "notUpdated":{"m2":{"type":"notFound","description":"gone"}}}"#,
+        )
+        .expect("valid Email/set response");
+        assert!(updated_count(&response).is_err());
     }
 }

@@ -7,6 +7,7 @@
 - A token restricted to an account may only name that account; a call without `account` runs against it, and `mail://accounts` lists only that account. Unknown tool names are refused.
 - An HTTP request that reaches the MCP handler without an authorization context is refused (fail closed). Stdio and secret-less loopback HTTP stay unrestricted.
 - `token create` rejects unknown scope strings; accepted are `mail:read`, `mail:modify`, `mail:send` and `*`.
+- **Behaviour change:** `mail_bulk_delete` no longer destroys mail by default (#4). It now moves the emails to the Trash mailbox (resolved by its `trash` role, else a folder named "Trash") and reports how many the server actually moved; without a Trash mailbox it fails and deletes nothing. Permanent destruction needs the new `permanent: true` argument and the new `capabilities.delete = true` (default false); the capability is checked before any request reaches the mail server.
 
 ## [1.1.1-2] - 2026-11-20
 

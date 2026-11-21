@@ -411,7 +411,8 @@ async fn test_read_path() {
     // There is no thread method on JmapClient (Thread/get is not used).
 }
 
-/// Draft create, search, keyword toggle, move to Trash, permanent delete.
+/// Draft create, search, keyword toggle, then both `mail_bulk_delete` modes:
+/// bulk move to Trash (default), then permanent destroy.
 /// Nothing is sent; only the created message is ever destroyed.
 #[tokio::test]
 #[ignore = "requires running Stalwart instance"]
@@ -506,21 +507,38 @@ async fn draft_steps(client: &JmapClient, id: &str, subject: &str) -> Result<(),
         return Err("Email/set $seen=true did not mark the email read".to_string());
     }
 
-    // Move to Trash and confirm it shows up there.
-    client
-        .move_email(id, &trash)
+    // mail_bulk_delete default (Trash mode): moved, not destroyed.
+    let moved = client
+        .bulk_move_to_trash(&[id.to_string()])
         .await
-        .map_err(|e| format!("Email/set update mailboxIds (move to Trash) failed: {e}"))?;
+        .map_err(|e| format!("Email/set update mailboxIds (bulk move to Trash) failed: {e}"))?;
+    if moved != 1 {
+        return Err(format!(
+            "bulk move to Trash reported {moved} moved, expected 1"
+        ));
+    }
     if !listed_in_mailbox(client, &trash, id).await? {
         return Err(format!("Email/query inMailbox Trash does not list {id}"));
     }
+    if listed_in_mailbox(client, &drafts, id).await? {
+        return Err(format!("{id} is still in Drafts after the move to Trash"));
+    }
     find_by_subject(client, subject, Some(&trash), id).await?;
-
-    // Permanent delete, then confirm it is gone.
     client
+        .get_email(id)
+        .await
+        .map_err(|e| format!("Trash mode destroyed {id}: {e}"))?;
+
+    // mail_bulk_delete permanent: true, then confirm it is gone.
+    let destroyed = client
         .bulk_destroy(&[id.to_string()])
         .await
         .map_err(|e| format!("Email/set destroy failed: {e}"))?;
+    if destroyed != 1 {
+        return Err(format!(
+            "Email/set destroy reported {destroyed}, expected 1"
+        ));
+    }
     if client.get_email(id).await.is_ok() {
         return Err(format!(
             "Email/set destroy reported success but {id} still exists"

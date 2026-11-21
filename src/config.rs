@@ -76,6 +76,11 @@ pub struct Capabilities {
     /// allowed. Default: false.
     #[serde(default)]
     pub vacation: bool,
+    /// Allow `mail_bulk_delete` with `permanent: true`, which destroys emails
+    /// beyond recovery. Moving them to Trash (the default) is always allowed.
+    /// Default: false.
+    #[serde(default)]
+    pub delete: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -213,10 +218,17 @@ mod tests {
     #[test]
     fn write_capabilities_default_to_off() {
         let caps: Capabilities = serde_json::from_str("{}").expect("capabilities");
-        assert!(!caps.send && !caps.spam_training && !caps.masked_email && !caps.vacation);
+        assert!(
+            !caps.send
+                && !caps.spam_training
+                && !caps.masked_email
+                && !caps.vacation
+                && !caps.delete
+        );
         let caps: Capabilities =
-            serde_json::from_str(r#"{"masked_email": true, "vacation": true}"#).expect("caps");
-        assert!(caps.masked_email && caps.vacation);
+            serde_json::from_str(r#"{"masked_email": true, "vacation": true, "delete": true}"#)
+                .expect("caps");
+        assert!(caps.masked_email && caps.vacation && caps.delete);
     }
 
     #[test]
