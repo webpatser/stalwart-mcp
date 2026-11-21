@@ -25,7 +25,9 @@ use crate::config::{AccountConfig, AppConfig, DEFAULT_PASSWORD_ENV};
 use crate::config_edit::{
     AccountEntry, AccountUpdate, ConfigDocument, DefaultAccountChange, PasswordSetting,
 };
-use crate::secret::{DEFAULT_COMMAND_TIMEOUT, Secret, run_password_command};
+use crate::secret::{
+    DEFAULT_COMMAND_TIMEOUT, Secret, program_permission_warnings, run_password_command,
+};
 use crate::secret_store::{
     CreatedItem, KEYCHAIN_SERVICE, Keychain, NewLogin, OnePassword, OpAccount, OpReference,
     SecretStores, StoreError, check_keychain_password, is_executable_file, matching_items,
@@ -1226,11 +1228,25 @@ async fn add(
     if make_default {
         writeln!(out, "'{name}' is the default account")?;
     }
+    warn_about_program(&entry.password, out)?;
     if args.no_verify {
         writeln!(
             out,
             "Credentials not checked (--no-verify); run `stalwart-mcp account test {name}`"
         )?;
+    }
+    Ok(())
+}
+
+/// Print [`program_permission_warnings`] for the program of a written
+/// `password_command` (Unix only; never a refusal).
+fn warn_about_program(setting: &PasswordSetting, out: &mut impl Write) -> Result<(), CliError> {
+    if let PasswordSetting::Command(argv) = setting
+        && let Some(program) = argv.first()
+    {
+        for warning in program_permission_warnings(program) {
+            writeln!(out, "{warning}")?;
+        }
     }
     Ok(())
 }
@@ -1454,6 +1470,7 @@ async fn edit(
     }
     if let Some(setting) = &setting {
         writeln!(out, "Password source: {}", SourceDescription::of(setting))?;
+        warn_about_program(setting, out)?;
     }
     if args.default {
         writeln!(out, "'{new_name}' is the default account")?;
@@ -1546,12 +1563,31 @@ async fn remove(
     out: &mut impl Write,
 ) -> Result<(), CliError> {
     let mut doc = ConfigDocument::load_or_new(path)?;
-    let entry = doc
-        .accounts()?
-        .into_iter()
+    let accounts = doc.accounts()?;
+    let entry = accounts
+        .iter()
         .find(|a| a.name == args.name)
         .ok_or_else(|| no_account(&args.name, path))?;
     let item = keychain_item(stores, &entry.password);
+    // Another account that reads the same item keeps it alive.
+    let shared_with = item.as_ref().and_then(|(_, account)| {
+        accounts
+            .iter()
+            .filter(|a| a.name != args.name)
+            .find(|a| {
+                keychain_item(stores, &a.password).is_some_and(|(_, other)| other == *account)
+            })
+            .map(|a| a.name.clone())
+    });
+    if args.delete_secret
+        && let (Some((keychain, account)), Some(other)) = (&item, &shared_with)
+    {
+        return Err(CliError::Usage(format!(
+            "the {} is also the password source of account '{other}', so it is not deleted; run \
+             the command without --delete-secret",
+            keychain_item_name(keychain, account)
+        )));
+    }
 
     if args.delete_secret && item.is_none() {
         return Err(match SourceDescription::of(&entry.password) {
@@ -1590,6 +1626,7 @@ async fn remove(
         prompter,
     )?;
     let delete = match &item {
+        _ if shared_with.is_some() => false,
         Some(_) if args.delete_secret => true,
         Some((keychain, account)) if !args.yes && prompter.interactive() => prompter.confirm(
             &format!("Also delete the {}?", keychain_item_name(keychain, account)),
@@ -1630,6 +1667,8 @@ async fn remove(
                 ))
             })?;
             writeln!(out, "Deleted the {name}")?;
+        } else if let Some(other) = &shared_with {
+            writeln!(out, "Kept the {name}; account '{other}' still reads it")?;
         } else {
             writeln!(
                 out,
@@ -3266,6 +3305,97 @@ esac
                 .filter(|l| l.starts_with("delete-generic-password"))
                 .count();
             assert_eq!(deletes, 2);
+        }
+
+        #[tokio::test]
+        async fn remove_never_deletes_an_item_another_account_reads() {
+            let f = Fakes::new();
+            let (_d, path) = temp_config();
+            let verifier = FakeVerifier::default();
+            let (result, out) = run_in(
+                &add_args("work", &KEYCHAIN_STDIN),
+                &path,
+                &mut stdin_script(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("add"), "{out}");
+            let mut doc = ConfigDocument::load_or_new(&path).expect("load");
+            doc.add_account(&AccountEntry {
+                name: "alias".into(),
+                url: "https://mail.example.com".into(),
+                username: "u@example.com".into(),
+                password: PasswordSetting::Command(f.keychain().password_command("work")),
+            })
+            .expect("add");
+            doc.save().expect("save");
+            let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+            let (result, _) = run_in(
+                &args(&["remove", "work", "--yes", "--delete-secret"]),
+                &path,
+                &mut Script::offline(),
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            let err = result.expect_err("shared").to_string();
+            assert!(err.contains("account 'alias'"), "{err}");
+            assert!(f.path("item.work").exists());
+            assert_eq!(account_count(&path), 2, "nothing removed");
+
+            // Interactive: no "also delete?" question, the item is kept.
+            let mut script = Script::answering(&["y"]);
+            let (result, out) = run_in(
+                &args(&["remove", "work"]),
+                &path,
+                &mut script,
+                &verifier,
+                &f.stores(),
+            )
+            .await;
+            assert!(result.expect("remove"), "{out}");
+            assert_eq!(script.questions.len(), 1, "{:?}", script.questions);
+            assert!(out.contains("account 'alias' still reads it"), "{out}");
+            assert!(f.path("item.work").exists());
+            assert!(
+                !f.read("security.argv")
+                    .lines()
+                    .any(|l| l.starts_with("delete-generic-password"))
+            );
+        }
+
+        #[tokio::test]
+        async fn a_writable_password_command_directory_is_warned_about() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let bin = dir.path().join("bin");
+            std::fs::create_dir(&bin).expect("mkdir");
+            let program = bin.join("pw");
+            std::fs::write(&program, format!("#!/bin/sh\nprintf '%s' '{FAKE}'\n")).expect("write");
+            std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o770)).expect("chmod");
+            let program = program.to_string_lossy().into_owned();
+            let (_d, path) = temp_config();
+            let (result, out) = run_in(
+                &add_args("work", &["--password-command", &program, "--no-verify"]),
+                &path,
+                &mut Script::offline(),
+                &FakeVerifier::default(),
+                &SecretStores::default(),
+            )
+            .await;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+            assert!(result.expect("added despite the warning"), "{out}");
+            let shown = std::fs::canonicalize(&bin).expect("canonical");
+            assert!(
+                out.contains("warning:")
+                    && out.contains(&shown.display().to_string())
+                    && out.contains("writable by group or others"),
+                "{out}"
+            );
+            assert_eq!(account_count(&path), 1);
         }
 
         #[tokio::test]

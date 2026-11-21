@@ -5,11 +5,12 @@
 //! scripts in their place. A password reaches a child only through stdin: the
 //! `op item create` JSON template (built with `serde_json`) and the
 //! `security -i` command line (built with [`quote_for_security`]). Every child
-//! has a timeout and is killed when it is dropped. Errors carry the exit
-//! status plus at most the first stderr line (200 characters, control
-//! characters removed, dropped when it contains the password), never stdout.
+//! has a timeout and is killed (on Unix with its process group) when it is
+//! dropped. Errors carry the exit status plus at most the first stderr line
+//! (200 characters, control characters removed), never stdout; for a child
+//! that received a password on stdin only the exit status.
 
-use crate::secret::{MAX_PASSWORD_OUTPUT, Secret};
+use crate::secret::{GroupChild, MAX_PASSWORD_OUTPUT, Secret};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
@@ -134,32 +135,42 @@ struct ToolOutput {
     stderr: Option<String>,
 }
 
+/// Whether a failure message may quote the child's stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StderrText {
+    /// The first stderr line (cleaned and capped) is shown.
+    Show,
+    /// Only the exit status is shown: for children that received a secret on
+    /// stdin, whose stderr could echo (part of) it in any form.
+    Omit,
+}
+
 impl ToolOutput {
     /// stdout on success, otherwise an error built from status and stderr.
-    fn success(self, action: &str, redact: Option<&str>) -> Result<Sensitive, StoreError> {
+    fn success(self, action: &str, stderr: StderrText) -> Result<Sensitive, StoreError> {
         if self.status.success() {
             Ok(self.stdout)
         } else {
-            Err(self.failure(action, redact))
+            Err(self.failure(action, stderr))
         }
     }
 
-    /// The error for a failed run; a stderr line containing `redact` is dropped.
-    fn failure(&self, action: &str, redact: Option<&str>) -> StoreError {
-        let stderr = self
-            .stderr
-            .clone()
-            .filter(|line| !redact.is_some_and(|s| !s.is_empty() && line.contains(s)));
+    /// The error for a failed run.
+    fn failure(&self, action: &str, stderr: StderrText) -> StoreError {
         StoreError::Failed {
             action: action.to_string(),
             status: self.status.to_string(),
-            stderr,
+            stderr: match stderr {
+                StderrText::Show => self.stderr.clone(),
+                StderrText::Omit => None,
+            },
         }
     }
 }
 
 /// Run `program args...` without a shell. `stdin` is written to the child and
-/// then closed (null when `None`). The child is killed after `timeout`.
+/// then closed (null when `None`). The child, and on Unix its whole process
+/// group, is killed after `timeout`.
 async fn run_tool(
     program: &str,
     args: &[&str],
@@ -167,7 +178,8 @@ async fn run_tool(
     timeout: Duration,
 ) -> Result<ToolOutput, StoreError> {
     let name = || program.to_string();
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -175,28 +187,29 @@ async fn run_tool(
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|source| StoreError::Spawn {
-            program: name(),
-            source,
-        })?;
+        .stderr(Stdio::piped());
+    let mut child = GroupChild::spawn(&mut command).map_err(|source| StoreError::Spawn {
+        program: name(),
+        source,
+    })?;
     let io_err = |source: io::Error| StoreError::Io {
         program: name(),
         source,
     };
-    let input = child.stdin.take();
+    let input = child.child.stdin.take();
     let stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| io_err(io::Error::other("no stdout pipe")))?;
     let stderr = child
+        .child
         .stderr
         .take()
         .ok_or_else(|| io_err(io::Error::other("no stderr pipe")))?;
 
-    // `child` moves into the future, so a timeout drops (and kills) it.
+    // `child` moves into the future, so a timeout drops it, which kills the
+    // child and its process group.
     let run = async move {
         let write = async {
             let (Some(mut pipe), Some(bytes)) = (input, stdin) else {
@@ -390,7 +403,7 @@ impl Keychain {
         match out.status.code() {
             Some(0) => Ok(true),
             Some(SECURITY_ITEM_NOT_FOUND) => Ok(false),
-            _ => Err(out.failure("security find-generic-password", None)),
+            _ => Err(out.failure("security find-generic-password", StderrText::Show)),
         }
     }
 
@@ -427,7 +440,7 @@ impl Keychain {
         )
         .await?;
         drop(line);
-        out.success("security add-generic-password", Some(password.expose()))?;
+        out.success("security add-generic-password", StderrText::Omit)?;
         if self.exists(account).await? {
             Ok(())
         } else {
@@ -454,7 +467,7 @@ impl Keychain {
             SECURITY_TIMEOUT,
         )
         .await?
-        .success("security delete-generic-password", None)?;
+        .success("security delete-generic-password", StderrText::Show)?;
         if self.exists(account).await? {
             return Err(StoreError::Unexpected(format!(
                 "the Keychain item (service '{}', account '{account}') still exists after \
@@ -465,13 +478,21 @@ impl Keychain {
         Ok(())
     }
 
-    /// The shell command a user can run to delete the item by hand.
+    /// The shell command a user can run to delete the item by hand; service
+    /// and account are single-quoted for a POSIX shell.
     pub fn delete_hint(&self, account: &str) -> String {
         format!(
-            "security delete-generic-password -s {} -a {account}",
-            self.service
+            "security delete-generic-password -s {} -a {}",
+            shell_quote(&self.service),
+            shell_quote(account)
         )
     }
+}
+
+/// `value` as one POSIX shell word: wrapped in single quotes, each `'`
+/// written as `'\''`.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }
 
 /// Refuse passwords the `security -i` command line cannot carry: a CR or LF
@@ -809,11 +830,16 @@ impl OnePassword {
         stdin: Option<&[u8]>,
         timeout: Duration,
         action: &str,
-        redact: Option<&str>,
     ) -> Result<Sensitive, StoreError> {
+        // A child that got stdin may have got the password: no stderr text.
+        let stderr = if stdin.is_some() {
+            StderrText::Omit
+        } else {
+            StderrText::Show
+        };
         run_tool(&self.program, args, stdin, timeout)
             .await?
-            .success(action, redact)
+            .success(action, stderr)
     }
 
     /// The accounts `op` knows (`op account list --format json`), which is
@@ -827,7 +853,6 @@ impl OnePassword {
                 None,
                 DETECT_TIMEOUT,
                 action,
-                None,
             )
             .await?;
         // An empty answer means no accounts.
@@ -855,7 +880,6 @@ impl OnePassword {
                 None,
                 OP_TIMEOUT,
                 action,
-                None,
             )
             .await?;
         if out.0.iter().all(u8::is_ascii_whitespace) {
@@ -894,7 +918,6 @@ impl OnePassword {
                 None,
                 OP_TIMEOUT,
                 action,
-                None,
             )
             .await?;
         let item: OpItem = parse_json(&out, action)?;
@@ -988,7 +1011,6 @@ impl OnePassword {
                 Some(json.0.as_slice()),
                 OP_TIMEOUT,
                 action,
-                Some(login.password.expose()),
             )
             .await?;
         drop(json);
@@ -1019,7 +1041,6 @@ impl OnePassword {
             None,
             OP_TIMEOUT,
             "op item delete",
-            None,
         )
         .await
         .map(drop)
@@ -1285,7 +1306,10 @@ mod tests {
                 std::fs::read_to_string(dir.path().join("in")).expect("in"),
                 FAKE
             );
-            let err = out.success("tool", None).expect_err("exit 3").to_string();
+            let err = out
+                .success("tool", StderrText::Show)
+                .expect_err("exit 3")
+                .to_string();
             assert!(err.contains("first line") && err.contains('3'), "{err}");
             assert!(
                 !err.contains("second") && !err.contains("secret-stdout"),
@@ -1294,18 +1318,85 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_stderr_line_with_the_password_is_dropped() {
+        async fn a_child_fed_a_secret_on_stdin_contributes_no_stderr_text() {
             let dir = tempfile::tempdir().expect("tempdir");
-            let path = script(dir.path(), &format!("echo 'bad: {FAKE}' >&2\nexit 1\n"));
-            let out = run_tool("/bin/sh", &[path.as_str()], None, Duration::from_secs(10))
+            // Echo a cut and quoted part of stdin, which a substring check on
+            // the full password would not catch.
+            let path = script(
+                dir.path(),
+                "in=$(cat)\nprintf 'bad: \"%s\"\\n' \"$(printf '%s' \"$in\" | cut -c1-7)\" >&2\nexit 1\n",
+            );
+            let op = OnePassword::new("/bin/sh");
+            let err = op
+                .run(
+                    &[path.as_str()],
+                    Some(FAKE.as_bytes()),
+                    Duration::from_secs(10),
+                    "tool",
+                )
                 .await
-                .expect("ran");
-            let err = out
-                .success("tool", Some(FAKE))
-                .expect_err("fails")
-                .to_string();
-            assert!(!err.contains(FAKE), "{err}");
-            assert!(err.contains("failed with"), "{err}");
+                .expect_err("fails");
+            assert!(
+                matches!(err, StoreError::Failed { stderr: None, .. }),
+                "{err}"
+            );
+            let msg = err.to_string();
+            assert!(!msg.contains("not-a-r") && !msg.contains("bad"), "{msg}");
+            assert!(msg.contains("failed with"), "{msg}");
+
+            // The same child without stdin shows its first stderr line.
+            let err = op
+                .run(&[path.as_str()], None, Duration::from_secs(10), "tool")
+                .await
+                .expect_err("fails");
+            assert!(err.to_string().contains("bad"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn a_background_grandchild_is_killed_at_the_timeout() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let pid_file = dir.path().join("pid");
+            let path = script(
+                dir.path(),
+                &format!("sleep 30 &\necho $! > '{}'\nexit 0\n", pid_file.display()),
+            );
+            let started = std::time::Instant::now();
+            let err = run_tool(
+                "/bin/sh",
+                &[path.as_str()],
+                None,
+                Duration::from_millis(500),
+            )
+            .await
+            .expect_err("timeout");
+            assert!(matches!(err, StoreError::Timeout { .. }), "{err}");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+                .expect("pid file")
+                .trim()
+                .parse()
+                .expect("pid");
+            let mut gone = false;
+            for _ in 0..30 {
+                // SAFETY: kill with signal 0 sends nothing.
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    gone = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(gone, "the background sleep survived");
+        }
+
+        #[test]
+        fn delete_hint_quotes_for_the_shell() {
+            let keychain = Keychain::new(SECURITY_PROGRAM, "svc; rm -rf ~");
+            assert_eq!(
+                keychain.delete_hint("it's a b;c"),
+                r"security delete-generic-password -s 'svc; rm -rf ~' -a 'it'\''s a b;c'"
+            );
+            assert_eq!(shell_quote(""), "''");
+            assert_eq!(shell_quote("'"), r"''\'''");
         }
 
         #[tokio::test]

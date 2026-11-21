@@ -92,6 +92,7 @@ To pick a build for your server, take the newest tag whose first three numbers a
 | `1.1.1-2`    | 1.1.1    |
 | `1.1.1-3`    | 1.1.1    |
 | `1.1.1-4`    | 1.1.1    |
+| `1.1.1-5`    | 1.1.1    |
 
 Test coverage for `1.0.3-1`: the HTTP transport, auth and the Sent/Drafts mailbox lookup were tested against a live Stalwart 1.0.3.
 
@@ -172,11 +173,25 @@ password_env = "STALWART_PASSWORD_WORK"
 Each account takes its password from one of two keys, never both:
 
 - `password_env = "VAR"`: the password is read from that environment variable. An account with neither key reads `STALWART_PASSWORD`, as in earlier versions.
-- `password_command = ["/abs/program", "arg", ...]`: the server runs this argv at startup, without a shell, with stdin closed, and takes its stdout as the password (at most 4 KiB, one trailing newline stripped). A command that fails, prints nothing or runs longer than 60 seconds is killed and the account is skipped with a warning naming it. `account add` writes this key for the 1Password and Keychain sources; any program that prints a password works.
+- `password_command = ["/abs/program", "arg", ...]`: the server runs this argv at startup, without a shell, with stdin closed, and takes its stdout as the password (at most 4 KiB, one trailing newline stripped). A command that fails, prints nothing or runs longer than 60 seconds is killed (on Unix together with every process it started) and the account is skipped with a warning naming it. `account add` writes this key for the 1Password and Keychain sources; any program that prints a password works.
 
 On Unix, a config that contains a `password_command` is refused unless the file is owned by you and neither the file nor its directory is writable by group or others (`chmod 600` on the file, `chmod 700` on the directory; `account add` creates them that way). Anyone who could edit the file could otherwise make the server run their command. This is not checked on Windows.
 
-Accounts come from the config file only: `STALWART_MCP_*` environment variables can no longer set or replace `accounts` (they could in earlier versions). Other settings can still be overridden that way.
+A command that `account add` or `account edit` writes is checked once more: when the program, or the directory it is in, belongs to another user (other than root) or is writable by group or others, a warning names the path. This is a warning only, because Homebrew directories are often group-writable; the program is still written to the config.
+
+Accounts come from the config file only: no `STALWART_MCP_*` environment variable can set, add or replace `accounts` or a `password_command`, whatever its spelling or nesting (they could in earlier versions). The environment can override exactly these settings, and no others:
+
+| Variable | Setting |
+|----------|---------|
+| `STALWART_MCP_SERVER_BIND` | `server.bind` |
+| `STALWART_MCP_CAPABILITIES_SEND` | `capabilities.send` |
+| `STALWART_MCP_CAPABILITIES_VACATION` | `capabilities.vacation` |
+| `STALWART_MCP_CAPABILITIES_DELETE` | `capabilities.delete` |
+| `STALWART_MCP_CAPABILITIES_SIEVE` | `capabilities.sieve` |
+| `STALWART_MCP_NOTIFICATIONS_ENABLED` | `notifications.enabled` |
+| `STALWART_MCP_AUTH_SECRET` | `auth.secret` |
+
+Every `_` in a variable name separates two levels, so a key that contains an underscore of its own cannot be reached from the environment: `default_account`, `server.allowed_hosts`, `capabilities.spam_training`, `capabilities.masked_email` and `notifications.ping_interval` must be set in the file.
 
 For the `env` source, export the variables in the environment that starts the server:
 

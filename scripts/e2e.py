@@ -16,6 +16,10 @@ disabled vacation response it restores) and removes it again, printing a
 CLEANUP line per item. By default it sends no mail; --send sends exactly one
 message to STALWART_TEST_SEND_TO.
 
+Section F runs the `account` CLI against its own temporary config (env source,
+STALWART_PASSWORD): `account add`, `account list --json` and `account test`.
+It sends no mail and prints no account values.
+
 Usage: python3 -I scripts/e2e.py [--send] [--bin PATH] [--port N] [--keep-logs]
 """
 
@@ -39,7 +43,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-VERSION = "1.1.1-4"
+VERSION = "1.1.1-5"
 ACCOUNT = "e2e"
 OTHER_ACCOUNT = "e2e-other"
 TS = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -1088,6 +1092,64 @@ def leftovers(s, ctx, jm):
         check("E", "sieve list as before", jm.sieve_scripts() == ctx["sieve_before"], "")
 
 
+# ---------------------------------------------------------------- account CLI
+
+ACCOUNT_KEYS = {"config", "default_account", "accounts"}
+ACCOUNT_ENTRY_KEYS = {"name", "url", "username", "default", "password_source"}
+
+
+def account_cli(cfg, *args, timeout=60):
+    """Run `stalwart-mcp --config <cfg> account ...` without a terminal."""
+    return subprocess.run([BIN, "--config", cfg, "account", *args],
+                          capture_output=True, text=True, timeout=timeout,
+                          stdin=subprocess.DEVNULL, env=os.environ)
+
+
+def account_flow():
+    """`account add` (env source), `list --json` and `test` on a temporary config.
+    Only exit codes, key names and the source kind are printed."""
+    tmp = tempfile.mkdtemp(prefix="stalwart-mcp-e2e-account-")  # mode 0700
+    cfg = os.path.join(tmp, "config.toml")
+    try:
+        r = account_cli(cfg, "add", "--name", ACCOUNT,
+                        "--url", os.environ["STALWART_TEST_URL"],
+                        "--username", os.environ["STALWART_TEST_USER"],
+                        "--password-source", "env", "--password-env", "STALWART_PASSWORD",
+                        "--yes")
+        if not check("F", "account add (env source)", r.returncode == 0 and os.path.exists(cfg),
+                     f"rc={r.returncode}" + ("" if r.returncode == 0
+                                             else f" {r.stderr.strip()[:200]}")):
+            return
+        mode = os.stat(cfg).st_mode & 0o777
+        check("F", "account add config mode 0600", mode == 0o600, f"mode={oct(mode)}")
+
+        r = account_cli(cfg, "list", "--json")
+        try:
+            data = json.loads(r.stdout)
+            accounts = data.get("accounts", [])
+            entry = accounts[0] if len(accounts) == 1 else {}
+            source = entry.get("password_source", {})
+            good = (r.returncode == 0 and set(data) == ACCOUNT_KEYS
+                    and set(entry) == ACCOUNT_ENTRY_KEYS
+                    and entry.get("name") == ACCOUNT and entry.get("default") is True
+                    and source.get("kind") == "env"
+                    and source.get("variable") == "STALWART_PASSWORD")
+            check("F", "account list --json", good,
+                  f"rc={r.returncode} keys={sorted(data)} entry_keys={sorted(entry)} "
+                  f"accounts={len(accounts)} source_kind={source.get('kind')}")
+        except (ValueError, AttributeError) as e:
+            check("F", "account list --json", False, f"rc={r.returncode} {type(e).__name__}")
+
+        r = account_cli(cfg, "test")
+        lines = r.stdout.strip().splitlines()
+        check("F", "account test ok", r.returncode == 0 and lines == [f"{ACCOUNT}: ok"],
+              f"rc={r.returncode} lines={len(lines)}"
+              + ("" if r.returncode == 0 else f" {r.stdout.strip()[:200]}"))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        cleanup(f"account CLI temporary config removed: gone={not os.path.exists(tmp)}")
+
+
 # ---------------------------------------------------------------- main
 
 def run(args, ctx):
@@ -1134,6 +1196,10 @@ def run(args, ctx):
             leftovers(s, ctx, jm)
         except Exception as e:  # noqa: BLE001
             check("E", "leftover check aborted", False, f"{type(e).__name__}: {e}")
+        try:
+            account_flow()
+        except Exception as e:  # noqa: BLE001
+            check("F", "section aborted", False, f"{type(e).__name__}: {e}")
     finally:
         s.close()
     return ctx

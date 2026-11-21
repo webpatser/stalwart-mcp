@@ -232,14 +232,36 @@ pub fn resolve_config_path(config_path: Option<&PathBuf>) -> PathBuf {
     config_path.cloned().unwrap_or_else(default_config_path)
 }
 
-/// `STALWART_MCP_*` overrides. `accounts` (and anything below it) is never
-/// taken from the environment, so neither accounts nor a `password_command`
-/// can be injected that way.
+/// Top-level sections that `STALWART_MCP_*` variables may set. Because of
+/// the `split("_")`, only keys without an underscore of their own work:
+/// `server.bind`, `capabilities.{send,vacation,delete,sieve}`,
+/// `notifications.enabled` and `auth.secret`.
+const ENV_SECTIONS: [&str; 4] = ["server", "capabilities", "notifications", "auth"];
+
+/// True when an env key (after the prefix and the `_` split) names one of
+/// [`ENV_SECTIONS`]. figment trims the key only after this filter ran, so the
+/// check trims and lowercases itself: ` ACCOUNTS` or `\tAccounts` is refused.
+fn env_key_allowed(key: &str) -> bool {
+    let key = key.trim().to_ascii_lowercase();
+    let section = key.split('.').next().unwrap_or_default().trim();
+    ENV_SECTIONS.contains(&section)
+}
+
+/// `STALWART_MCP_*` overrides, limited to [`ENV_SECTIONS`]. `accounts` is not
+/// among them; [`AppConfig::load_from`] also takes the accounts from the file
+/// alone, so neither accounts nor a `password_command` can be injected
+/// through the environment, whatever shape the variable name has.
 fn env_provider() -> Env {
-    Env::prefixed("STALWART_MCP_").split("_").filter(|key| {
-        let key = key.as_str().to_ascii_lowercase();
-        key != "accounts" && !key.starts_with("accounts.")
-    })
+    Env::prefixed("STALWART_MCP_")
+        .split("_")
+        .filter(|key| env_key_allowed(key.as_str()))
+}
+
+/// The part of the config that only the file may set.
+#[derive(Debug, Deserialize)]
+struct FileOnly {
+    #[serde(default)]
+    accounts: Vec<AccountConfig>,
 }
 
 impl AppConfig {
@@ -285,18 +307,28 @@ impl AppConfig {
             }
         };
 
-        let config: AppConfig = Figment::new()
+        let mut config: AppConfig = Figment::new()
             .merge(Toml::string(&content))
             .merge(env_provider())
             .extract()
             .map_err(|e| AppError::Config(e.to_string()))?;
+        // Accounts come from the file bytes alone, never from the merge.
+        let file_only: FileOnly = Figment::from(Toml::string(&content))
+            .extract()
+            .map_err(|e| AppError::Config(e.to_string()))?;
+        config.accounts = file_only.accounts;
 
         config.validate_accounts()?;
 
-        if let Some(file) = &file
-            && config.accounts.iter().any(|a| a.password_command.is_some())
-        {
-            crate::secret::check_config_permissions(file, path)?;
+        if config.accounts.iter().any(|a| a.password_command.is_some()) {
+            match &file {
+                Some(file) => crate::secret::check_config_permissions(file, path)?,
+                None => {
+                    return Err(AppError::Config(
+                        "a password_command is only honoured from a config file".into(),
+                    ));
+                }
+            }
         }
 
         Ok(config)
@@ -563,23 +595,100 @@ mod tests {
         assert!(config.accounts.is_empty());
     }
 
+    const EVIL: &str = "[{name=\"evil\",url=\"https://evil.example\",username=\"e\",password_command=[\"/bin/sh\"]}]";
+
+    #[test]
+    fn env_key_filter_refuses_accounts_in_any_shape() {
+        for key in [
+            "accounts",
+            " accounts",
+            "\taccounts",
+            "AcCoUnTs",
+            "accounts.0.name",
+            " accounts.0.password_command",
+            "default.account",
+            "unknown",
+            "",
+        ] {
+            assert!(!env_key_allowed(key), "{key:?}");
+        }
+        for key in [
+            "server.bind",
+            "SERVER.BIND",
+            "capabilities.send",
+            "auth.secret",
+        ] {
+            assert!(env_key_allowed(key), "{key:?}");
+        }
+    }
+
     #[test]
     fn environment_cannot_set_accounts() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::set(&[
-            (
-                "STALWART_MCP_ACCOUNTS",
-                "[{name=\"evil\",url=\"https://evil.example\",username=\"e\",password_command=[\"/bin/sh\"]}]",
-            ),
+            ("STALWART_MCP_ACCOUNTS", EVIL),
+            ("STALWART_MCP_ ACCOUNTS", EVIL),
+            ("STALWART_MCP_\tACCOUNTS", EVIL),
+            ("STALWART_MCP_AcCoUnTs", EVIL),
             ("STALWART_MCP_ACCOUNTS_0_NAME", "evil"),
+            ("STALWART_MCP_ ACCOUNTS_0_PASSWORD_COMMAND", "[\"/bin/sh\"]"),
             ("STALWART_MCP_SERVER_BIND", "127.0.0.1:3999"),
         ]);
+        // Nothing below `accounts` gets past the provider at all.
+        assert!(
+            env_provider()
+                .iter()
+                .all(|(key, _)| !key.as_str().contains("accounts")),
+            "an accounts key passed the env filter"
+        );
+
         let config = load_str(ACCOUNT).expect("ok");
         assert_eq!(config.accounts.len(), 1);
         assert_eq!(config.accounts[0].name, "a");
         assert!(config.accounts[0].password_command.is_none());
         // Other overrides still apply.
         assert_eq!(config.server.bind, "127.0.0.1:3999");
+
+        // Without a file there are no accounts, and none from the environment.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = AppConfig::load_allow_empty(Some(&dir.path().join("missing.toml")))
+            .expect("missing ok");
+        assert!(config.accounts.is_empty());
+        assert_eq!(config.server.bind, "127.0.0.1:3999");
+    }
+
+    /// Exactly these `STALWART_MCP_*` overrides work (the README lists them);
+    /// keys with an underscore of their own cannot be reached because of the
+    /// `split("_")`.
+    #[test]
+    fn which_environment_overrides_work() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::set(&[
+            ("STALWART_MCP_SERVER_BIND", "127.0.0.1:3998"),
+            ("STALWART_MCP_CAPABILITIES_SEND", "true"),
+            ("STALWART_MCP_CAPABILITIES_VACATION", "true"),
+            ("STALWART_MCP_CAPABILITIES_DELETE", "true"),
+            ("STALWART_MCP_CAPABILITIES_SIEVE", "true"),
+            ("STALWART_MCP_NOTIFICATIONS_ENABLED", "false"),
+            ("STALWART_MCP_AUTH_SECRET", "env-secret-value"),
+            // These do not work:
+            ("STALWART_MCP_DEFAULT_ACCOUNT", "b"),
+            ("STALWART_MCP_SERVER_ALLOWED_HOSTS", "[\"mcp.example.com\"]"),
+            ("STALWART_MCP_CAPABILITIES_SPAM_TRAINING", "true"),
+            ("STALWART_MCP_CAPABILITIES_MASKED_EMAIL", "true"),
+            ("STALWART_MCP_NOTIFICATIONS_PING_INTERVAL", "5"),
+        ]);
+        let config = load_str(ACCOUNT).expect("ok");
+        assert_eq!(config.server.bind, "127.0.0.1:3998");
+        let caps = &config.capabilities;
+        assert!(caps.send && caps.vacation && caps.delete && caps.sieve);
+        assert!(!config.notifications.enabled);
+        assert_eq!(config.auth.secret.as_deref(), Some("env-secret-value"));
+
+        assert_eq!(config.default_account, None);
+        assert!(config.server.allowed_hosts.is_empty());
+        assert!(!caps.spam_training && !caps.masked_email);
+        assert_eq!(config.notifications.ping_interval, 30);
     }
 
     #[cfg(unix)]

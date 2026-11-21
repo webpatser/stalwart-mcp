@@ -90,8 +90,9 @@ pub enum PasswordCommandError {
 /// Run `argv` without a shell and return its stdout as the password.
 ///
 /// stdin is null; stdout is capped at [`MAX_PASSWORD_OUTPUT`] bytes and one
-/// trailing `\n` or `\r\n` is stripped. The child is killed when `timeout`
-/// passes (and whenever the returned future is dropped).
+/// trailing `\n` or `\r\n` is stripped. The child, and on Unix its whole
+/// process group, is killed when `timeout` passes (and whenever the returned
+/// future is dropped).
 pub async fn run_password_command(
     argv: &[String],
     timeout: Duration,
@@ -101,25 +102,27 @@ pub async fn run_password_command(
         return Err(PasswordCommandError::EmptyArgv);
     }
 
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(PasswordCommandError::Spawn)?;
+        .stderr(Stdio::piped());
+    let mut child = GroupChild::spawn(&mut command).map_err(PasswordCommandError::Spawn)?;
 
     let stdout = child
+        .child
         .stdout
         .take()
         .ok_or_else(|| PasswordCommandError::Read(io::Error::other("no stdout pipe")))?;
     let stderr = child
+        .child
         .stderr
         .take()
         .ok_or_else(|| PasswordCommandError::Read(io::Error::other("no stderr pipe")))?;
 
-    // `child` moves into the future, so a timeout drops (and kills) it.
+    // `child` moves into the future, so a timeout drops it, which kills the
+    // child and everything it started (its process group).
     let run = async move {
         let (out, err) = tokio::join!(
             read_capped(stdout, MAX_PASSWORD_OUTPUT as u64 + 1),
@@ -150,6 +153,50 @@ async fn read_capped(reader: impl AsyncRead + Unpin, limit: u64) -> io::Result<V
     let mut buf = Vec::new();
     reader.take(limit).read_to_end(&mut buf).await?;
     Ok(buf)
+}
+
+/// A child started in its own process group (Unix). Dropped before
+/// [`Self::wait`] returned, it kills the whole group, so a grandchild that
+/// holds a pipe open (`sleep 30 &`) dies with it; elsewhere only the direct
+/// child is killed (`kill_on_drop`).
+#[derive(Debug)]
+pub(crate) struct GroupChild {
+    pub(crate) child: tokio::process::Child,
+    /// Set once the child was reaped; its pid may then belong to another
+    /// process, so the group is no longer signalled.
+    reaped: bool,
+}
+
+impl GroupChild {
+    pub(crate) fn spawn(command: &mut Command) -> io::Result<Self> {
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.kill_on_drop(true).spawn()?;
+        Ok(Self {
+            child,
+            reaped: false,
+        })
+    }
+
+    pub(crate) async fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        self.reaped = true;
+        Ok(status)
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if !self.reaped
+            && let Some(pid) = self.child.id()
+            && let Ok(pgid) = libc::pid_t::try_from(pid)
+        {
+            // SAFETY: killpg has no memory preconditions. The child is not
+            // reaped yet, so its pid (the group id) cannot have been reused.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
 }
 
 fn to_secret(mut out: Vec<u8>) -> Result<Secret, PasswordCommandError> {
@@ -238,6 +285,60 @@ pub fn check_config_permissions(file: &std::fs::File, path: &Path) -> Result<(),
 #[cfg(not(unix))]
 pub fn check_config_permissions(_file: &std::fs::File, _path: &Path) -> Result<(), AppError> {
     Ok(())
+}
+
+/// Warnings about the program of a `password_command` (`argv[0]`): the file
+/// (after following symlinks) and its directory (the literal one and the
+/// resolved one) should be owned by the current user or root and not be
+/// writable by group or others, otherwise someone else could replace what
+/// runs. Only warnings: Homebrew directories are often group-writable.
+/// Empty on non-Unix systems and when everything is fine.
+#[cfg(unix)]
+pub fn program_permission_warnings(program: &str) -> Vec<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    let path = Path::new(program);
+    let mut checked: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        checked.push(resolved.clone());
+        if let Some(parent) = path.parent().and_then(|p| std::fs::canonicalize(p).ok()) {
+            checked.push(parent);
+        }
+        if let Some(parent) = resolved.parent()
+            && !checked.iter().any(|c| c == parent)
+        {
+            checked.push(parent.to_path_buf());
+        }
+    }
+    let mut warnings = Vec::new();
+    for (index, checked_path) in checked.iter().enumerate() {
+        let Ok(meta) = std::fs::metadata(checked_path) else {
+            continue;
+        };
+        let what = if index == 0 { "program" } else { "directory" };
+        let shown = checked_path.display();
+        if meta.uid() != uid && meta.uid() != 0 {
+            warnings.push(format!(
+                "warning: the password command {what} {shown} is owned by another user, who \
+                 could change what runs"
+            ));
+        }
+        if meta.mode() & 0o022 != 0 {
+            warnings.push(format!(
+                "warning: the password command {what} {shown} is writable by group or others, \
+                 who could change what runs"
+            ));
+        }
+    }
+    warnings
+}
+
+/// Program permission checks are not implemented on this platform.
+#[cfg(not(unix))]
+pub fn program_permission_warnings(_program: &str) -> Vec<String> {
+    Vec::new()
 }
 
 #[cfg(unix)]
@@ -362,6 +463,47 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    /// True while a process with `pid` exists (signal 0 only probes).
+    #[cfg(unix)]
+    fn alive(pid: libc::pid_t) -> bool {
+        // SAFETY: kill with signal 0 sends nothing.
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Waits up to 3 s for `pid` to disappear.
+    #[cfg(unix)]
+    async fn gone(pid: libc::pid_t) -> bool {
+        for _ in 0..30 {
+            if !alive(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_grandchild_holding_stdout_is_killed_at_the_timeout() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let started = Instant::now();
+        let err = run_script(
+            &format!("sleep 30 &\necho $! > '{}'\nexit 0\n", pid_file.display()),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect_err("timeout");
+        assert!(matches!(err, PasswordCommandError::Timeout(_)), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        assert!(gone(pid).await, "the background sleep survived");
+    }
+
     #[tokio::test]
     async fn refuses_empty_output() {
         let err = run("exit 0\n").await.expect_err("empty");
@@ -435,6 +577,44 @@ mod tests {
                 .expect_err("refused")
                 .to_string();
             assert!(err.contains("chmod 600"), "{err}");
+        }
+
+        #[test]
+        fn program_warnings_name_writable_files_and_dirs() {
+            use super::super::program_permission_warnings;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let bin = dir.path().join("bin");
+            std::fs::create_dir(&bin).expect("mkdir");
+            let program = bin.join("pw");
+            std::fs::write(&program, "#!/bin/sh\n").expect("write");
+            let program_str = program.to_str().expect("utf8");
+            let canonical = |p: &std::path::Path| {
+                std::fs::canonicalize(p)
+                    .expect("canonical")
+                    .display()
+                    .to_string()
+            };
+
+            std::fs::set_permissions(&program, Permissions::from_mode(0o700)).expect("chmod");
+            std::fs::set_permissions(&bin, Permissions::from_mode(0o700)).expect("chmod");
+            assert!(program_permission_warnings(program_str).is_empty());
+
+            std::fs::set_permissions(&program, Permissions::from_mode(0o722)).expect("chmod");
+            let warnings = program_permission_warnings(program_str);
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains(&canonical(&program)), "{warnings:?}");
+            assert!(warnings[0].contains("writable by group or others"));
+
+            std::fs::set_permissions(&program, Permissions::from_mode(0o700)).expect("chmod");
+            std::fs::set_permissions(&bin, Permissions::from_mode(0o770)).expect("chmod");
+            let warnings = program_permission_warnings(program_str);
+            std::fs::set_permissions(&bin, Permissions::from_mode(0o700)).expect("chmod");
+            assert_eq!(warnings.len(), 1, "{warnings:?}");
+            assert!(warnings[0].contains("directory"), "{warnings:?}");
+            assert!(warnings[0].contains(&canonical(&bin)), "{warnings:?}");
+
+            // A missing program yields no warning (the add checks existence).
+            assert!(program_permission_warnings("/nonexistent/stalwart-mcp-x").is_empty());
         }
 
         #[test]

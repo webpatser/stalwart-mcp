@@ -81,9 +81,6 @@ pub enum CliError {
     /// Wrong or missing input; the message names the flag.
     #[error("{0}")]
     Usage(String),
-    /// A flag or source that a later version fills in.
-    #[error("{0} is not available yet in this version")]
-    NotAvailable(String),
     /// A credential check or password source failed.
     #[error("{0}")]
     Failed(String),

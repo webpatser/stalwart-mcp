@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.1.1-5] - Unreleased
+## [1.1.1-5] - 2026-11-21
 
 ### Added
 - Per-account `password_command`: an argv array run without a shell whose stdout is the password (stdin closed, at most 4 KiB, one trailing newline stripped, killed after 60 s). A failure names the account and carries the exit status plus at most the first stderr line, never the output. Use it or `password_env`, not both; with neither, `STALWART_PASSWORD` is read as before.
@@ -10,7 +10,8 @@
 - Password source `keychain` (macOS): the typed password is stored with `/usr/bin/security -i` (the command goes on stdin, never on a command line; no `-A`) under service `stalwart-mcp` and the account name, and the config stores `password_command = ["/usr/bin/security", "find-generic-password", "-s", "stalwart-mcp", "-a", "<name>", "-w"]`. An existing item is refused unless `--force`; passwords with a line break are refused.
 - When the source is asked for on a terminal, the suggested default is 1Password when detected, else the Keychain on macOS, else `env`; without a terminal `--password-source` is required.
 - A failure after a secret was stored (writing the config, the final read-back) deletes the 1Password item or Keychain item this run created again, and names it when that fails. An item overwritten with `--force` is not deleted.
-- `account remove --delete-secret` deletes the Keychain item, located from the stored `password_command` (only when it has exactly the shape above), after the account is removed from the config; without the flag an interactive run asks. 1Password items are never deleted by `remove`.
+- `account remove --delete-secret` deletes the Keychain item, located from the stored `password_command` (only when it has exactly the shape above), after the account is removed from the config; without the flag an interactive run asks. An item that another remaining account also reads is never deleted: `--delete-secret` is refused and the prompt is skipped. 1Password items are never deleted by `remove`. The printed hint for deleting an item by hand single-quotes the service and account for the shell.
+- `account add` and `account edit` print a warning naming the path when the program of a written `password_command`, or its directory, belongs to another user (other than root) or is writable by group or others (Unix; a warning, not a refusal).
 - `account edit --rename` of an account whose source is its own Keychain item moves the item to the new name (store, write, check, then delete the old item), so the item keeps matching the account.
 
 ### Changed
@@ -18,8 +19,10 @@
 - README: new "Connecting a client" section replaces the scattered client snippets (Claude Code, Claude Desktop, other stdio clients, HTTP with tokens); the examples no longer put the password in a client config file. It now starts from `stalwart-mcp account add` with a 1Password or Keychain source, so the client runs the binary directly; the wrapper script with an env file is the fallback.
 
 ### Security
-- `accounts` can no longer be set or replaced through `STALWART_MCP_*` environment variables; they come from the config file only. Other overrides keep working.
-- On Unix a config containing a `password_command` is refused unless the file is owned by the current user and neither the file nor its directory is writable by group or others; the error names the fix (`chmod 600`). The check runs on the handle the file was read from. Not checked on Windows.
+- `accounts` can no longer be set or replaced through `STALWART_MCP_*` environment variables; they come from the config file bytes alone, whatever the variable's spelling (also with a space or tab after the prefix, mixed case or a nested key). The environment may only set keys under `server`, `capabilities`, `notifications` and `auth`; the README lists the overrides that work, and that keys with an underscore of their own (`default_account`, `server.allowed_hosts`, `capabilities.spam_training`, `capabilities.masked_email`, `notifications.ping_interval`) cannot be set from the environment, as before.
+- On Unix a config containing a `password_command` is refused unless the file is owned by the current user and neither the file nor its directory is writable by group or others; the error names the fix (`chmod 600`). The check runs on the handle the file was read from, and a `password_command` without a config file is refused. Not checked on Windows.
+- A password command, and every `op` or `security` call, runs in its own process group on Unix; on a timeout the whole group is killed, so a background process holding the output pipe cannot outlive it.
+- A failing `security -i` (Keychain store) or `op item create`, both of which receive the password on stdin, is reported with its exit status only, without any stderr text.
 - Passwords are held in a type whose `Debug` output is redacted.
 
 ## [1.1.1-4] - 2026-11-21
